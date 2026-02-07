@@ -1,0 +1,49 @@
+{
+  "name": "multimodal-rag",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin for multimodal RAG - semantic indexing and time-aware search for images and audio using local AI models",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hzttt/multimodal-rag.git"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node test/test-embedding.js"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "rag",
+    "multimodal",
+    "vision",
+    "embedding",
+    "lancedb",
+    "ollama",
+    "whisper"
+  ],
+  "author": "hzttt",
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "src/",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "dependencies": {
+    "@lancedb/lancedb": "^0.14.0",
+    "@sinclair/typebox": "^0.33.0",
+    "chokidar": "^4.0.0"
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "install": {
+      "npmSpec": "multimodal-rag"
+    }
+  }
+}

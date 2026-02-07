@@ -1,0 +1,114 @@
+{
+  "id": "multimodal-rag",
+  "name": "Multimodal RAG",
+  "description": "多模态 RAG 插件，使用本地 AI 模型对图像和音频进行语义索引与时间感知搜索",
+  "version": "0.1.0",
+  "kind": "rag",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "watchPaths": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "监听的文件夹路径列表（支持 ~ 展开）"
+      },
+      "fileTypes": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"]
+          },
+          "audio": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac"]
+          }
+        },
+        "default": {}
+      },
+      "ollama": {
+        "type": "object",
+        "properties": {
+          "baseUrl": {
+            "type": "string",
+            "default": "http://127.0.0.1:11434"
+          },
+          "visionModel": {
+            "type": "string",
+            "default": "qwen3-vl:2b",
+            "description": "用于图像描述的视觉模型"
+          },
+          "embedModel": {
+            "type": "string",
+            "default": "qwen3-embedding:latest",
+            "description": "用于生成嵌入向量的模型"
+          }
+        },
+        "default": {}
+      },
+      "embedding": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": ["ollama", "openai"],
+            "default": "ollama"
+          },
+          "openaiApiKey": {
+            "type": "string",
+            "description": "OpenAI API Key（仅当 provider=openai 时需要）"
+          },
+          "openaiModel": {
+            "type": "string",
+            "default": "text-embedding-3-small"
+          }
+        },
+        "default": {}
+      },
+      "dbPath": {
+        "type": "string",
+        "default": "~/.openclaw/multimodal-rag.lance",
+        "description": "LanceDB 数据库路径"
+      },
+      "watchDebounceMs": {
+        "type": "number",
+        "default": 1000,
+        "description": "文件监听去抖延迟（毫秒）"
+      },
+      "indexExistingOnStart": {
+        "type": "boolean",
+        "default": true,
+        "description": "启动时是否索引现有文件"
+      }
+    }
+  },
+  "uiHints": {
+    "watchPaths": {
+      "label": "监听路径",
+      "placeholder": "~/mic-recordings"
+    },
+    "ollama.visionModel": {
+      "label": "视觉模型",
+      "placeholder": "qwen3-vl:2b"
+    },
+    "ollama.embedModel": {
+      "label": "嵌入模型",
+      "placeholder": "qwen3-embedding:latest"
+    },
+    "embedding.openaiApiKey": {
+      "label": "OpenAI API Key",
+      "sensitive": true
+    },
+    "dbPath": {
+      "label": "数据库路径",
+      "advanced": true
+    },
+    "watchDebounceMs": {
+      "label": "去抖延迟（毫秒）",
+      "advanced": true
+    }
+  }
+}
