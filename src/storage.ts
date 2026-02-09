@@ -4,6 +4,7 @@
 
 import * as lancedb from "@lancedb/lancedb";
 import { randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
 import type { MediaEntry, MediaSearchResult, MediaType } from "./types.js";
 
 const TABLE_NAME = "media";
@@ -18,6 +19,20 @@ export type SearchOptions = {
   before?: number; // Unix timestamp (ms)
   limit?: number;
   minScore?: number;
+  dedupeByHash?: boolean;
+};
+
+export type CleanupMissingOptions = {
+  dryRun?: boolean;
+  limit?: number;
+  candidates?: Array<{ id: string; filePath: string }>;
+};
+
+export type CleanupMissingResult = {
+  scanned: number;
+  missing: number;
+  removed: number;
+  missingIds: string[];
 };
 
 /**
@@ -108,6 +123,16 @@ export class MediaStorage {
   }
 
   /**
+   * 按文件路径替换条目（先删后插）
+   */
+  async replaceByPath(entry: Omit<MediaEntry, "id" | "indexedAt">): Promise<MediaEntry> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+    await this.deleteByPath(entry.filePath);
+    return this.store(entry);
+  }
+
+  /**
    * 搜索媒体（支持时间过滤）
    */
   async search(
@@ -124,10 +149,12 @@ export class MediaStorage {
       before,
       limit = 5,
       minScore = 0.5,
+      dedupeByHash = true,
     } = options;
 
     // 构建查询
-    let query = this.table!.vectorSearch(vector).limit(limit * 2); // 多获取一些，过滤后可能不够
+    const candidateLimit = Math.max(limit * (dedupeByHash ? 8 : 2), limit);
+    let query = this.table!.vectorSearch(vector).limit(candidateLimit); // 多获取一些，过滤后可能不够
 
     // 时间过滤（LanceDB 字段名需要反引号包裹，大小写敏感）
     if (after || before || type !== "all") {
@@ -174,8 +201,29 @@ export class MediaStorage {
       };
     });
 
-    // 过滤低分结果并限制数量
-    return mapped.filter((r) => r.score >= minScore).slice(0, limit);
+    // 过滤低分结果
+    const filtered = mapped.filter((r) => r.score >= minScore);
+
+    // 默认按内容 hash 去重展示：只保留每个 hash 的首条（分数最高）
+    if (!dedupeByHash) {
+      return filtered.slice(0, limit);
+    }
+
+    const seenHashes = new Set<string>();
+    const deduped: MediaSearchResult[] = [];
+    for (const item of filtered) {
+      const hash = String(item.entry.fileHash ?? "");
+      const dedupeKey = hash || item.entry.id;
+      if (seenHashes.has(dedupeKey)) {
+        continue;
+      }
+      seenHashes.add(dedupeKey);
+      deduped.push(item);
+      if (deduped.length >= limit) {
+        break;
+      }
+    }
+    return deduped;
   }
 
   /**
@@ -264,6 +312,31 @@ export class MediaStorage {
   }
 
   /**
+   * 按路径删除条目
+   */
+  async deleteByPath(filePath: string): Promise<number> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    const matches = await this.findEntriesByPath(filePath);
+    if (matches.length === 0) {
+      return 0;
+    }
+
+    let removed = 0;
+    for (const entry of matches) {
+      try {
+        if (await this.delete(entry.id)) {
+          removed++;
+        }
+      } catch {
+        // 忽略异常 ID，继续处理其余条目
+      }
+    }
+    return removed;
+  }
+
+  /**
    * 获取所有行（不使用 where 过滤，避免 LanceDB 查询 bug）
    *
    * 重要: LanceDB query().toArray() 有一个隐含的默认 limit（约 10 行），
@@ -286,6 +359,34 @@ export class MediaStorage {
       console.warn(`[multimodal-rag] getAllRows failed: ${String(error)}`);
       return [];
     }
+  }
+
+  private async findEntriesByPath(filePath: string): Promise<MediaEntry[]> {
+    try {
+      const results = await this.table!
+        .query()
+        .where("`filePath` = '" + filePath.replace(/'/g, "''") + "'")
+        .limit(1000)
+        .toArray();
+      if (Array.isArray(results) && results.length > 0) {
+        return results.map((row) => this.rowToFullEntry(row));
+      }
+    } catch {
+      // where 查询失败，回退到全量扫描
+    }
+
+    const allRows = await this.getAllRows();
+    return allRows
+      .filter((r) => r.filePath === filePath)
+      .map((row) => this.rowToFullEntry(row));
+  }
+
+  /**
+   * 列出全部条目（不分页）
+   */
+  async listAllEntries(): Promise<Omit<MediaEntry, "vector">[]> {
+    const rows = await this.getAllRows();
+    return rows.map((row) => this.rowToEntry(row));
   }
 
   /**
@@ -393,6 +494,76 @@ export class MediaStorage {
     }
 
     return { removed, candidates: candidates.length };
+  }
+
+  /**
+   * 清理“索引存在但原文件已丢失”的条目
+   */
+  async cleanupMissingEntries(
+    options: CleanupMissingOptions = {},
+  ): Promise<CleanupMissingResult> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    const { dryRun = false, limit, candidates } = options;
+    let scanPool: Array<{ id: string; filePath: string }> = [];
+
+    if (Array.isArray(candidates) && candidates.length > 0) {
+      scanPool = candidates
+        .map((c) => ({ id: String(c.id ?? ""), filePath: String(c.filePath ?? "") }))
+        .filter((c) => c.id && c.filePath);
+    } else {
+      const rows = await this.getAllRows();
+      const limitedRows =
+        typeof limit === "number" && Number.isFinite(limit) && limit > 0
+          ? rows.slice(0, Math.floor(limit))
+          : rows;
+      scanPool = limitedRows
+        .map((row) => ({
+          id: String(row.id ?? ""),
+          filePath: String(row.filePath ?? ""),
+        }))
+        .filter((row) => row.id && row.filePath);
+    }
+
+    const scanned = scanPool.length;
+    const missingIds: string[] = [];
+    for (const item of scanPool) {
+      if (await this.isPathMissing(item.filePath)) {
+        missingIds.push(item.id);
+      }
+    }
+
+    const uniqueMissingIds = [...new Set(missingIds)];
+    let removed = 0;
+    if (!dryRun) {
+      for (const id of uniqueMissingIds) {
+        try {
+          if (await this.delete(id)) {
+            removed++;
+          }
+        } catch {
+          // 忽略异常 ID，继续处理其余条目
+        }
+      }
+    }
+
+    return {
+      scanned,
+      missing: uniqueMissingIds.length,
+      removed,
+      missingIds: uniqueMissingIds,
+    };
+  }
+
+  private async isPathMissing(filePath: string): Promise<boolean> {
+    try {
+      await stat(filePath);
+      return false;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return code === "ENOENT" || code === "ENOTDIR";
+    }
   }
 
   /**

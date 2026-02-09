@@ -5,6 +5,7 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { stat } from "node:fs/promises";
 import { MediaStorage } from "./src/storage.js";
 import { createEmbeddingProvider } from "./src/embeddings.js";
 import { createMediaProcessor } from "./src/processor.js";
@@ -18,6 +19,38 @@ import {
 } from "./src/tools.js";
 import { runSetup, runNonInteractiveSetup } from "./src/setup.js";
 import type { PluginConfig } from "./src/types.js";
+
+function isMissingPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+async function splitCliExistingAndMissingCandidates(
+  candidates: Array<{ id: string; filePath: string }>,
+): Promise<{ existingIds: Set<string>; missingCandidates: Array<{ id: string; filePath: string }> }> {
+  const checks = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        await stat(candidate.filePath);
+        return { ...candidate, missing: false };
+      } catch (error) {
+        return { ...candidate, missing: isMissingPathError(error) };
+      }
+    }),
+  );
+
+  const existingIds = new Set<string>();
+  const missingCandidates: Array<{ id: string; filePath: string }> = [];
+  for (const item of checks) {
+    if (item.missing) {
+      missingCandidates.push({ id: item.id, filePath: item.filePath });
+      continue;
+    }
+    existingIds.add(item.id);
+  }
+
+  return { existingIds, missingCandidates };
+}
 
 const multimodalRagPlugin = {
   id: "multimodal-rag",
@@ -174,19 +207,39 @@ const multimodalRagPlugin = {
               minScore: 0.3,
             });
 
-            if (results.length === 0) {
-              console.log("未找到相关媒体文件");
+            const { existingIds, missingCandidates } = await splitCliExistingAndMissingCandidates(
+              results.map((r) => ({ id: r.entry.id, filePath: r.entry.filePath })),
+            );
+            let cleanedMissing = 0;
+            if (missingCandidates.length > 0) {
+              const cleanupResult = await storage.cleanupMissingEntries({
+                candidates: missingCandidates,
+                dryRun: false,
+              });
+              cleanedMissing = cleanupResult.removed;
+            }
+            const visibleResults = results.filter((r) => existingIds.has(r.entry.id));
+
+            if (visibleResults.length === 0) {
+              if (cleanedMissing > 0) {
+                console.log(`未找到相关媒体文件（已自动清理 ${cleanedMissing} 条失效索引）`);
+              } else {
+                console.log("未找到相关媒体文件");
+              }
               return;
             }
 
-            console.log(`找到 ${results.length} 个相关媒体文件:\n`);
-            for (const r of results) {
+            console.log(`找到 ${visibleResults.length} 个相关媒体文件:\n`);
+            for (const r of visibleResults) {
               const date = new Date(r.entry.fileCreatedAt).toLocaleString("zh-CN");
               const score = (r.score * 100).toFixed(0);
               console.log(`[${r.entry.fileType}] ${r.entry.fileName} (${score}%)`);
               console.log(`  路径: ${r.entry.filePath}`);
               console.log(`  时间: ${date}`);
               console.log(`  描述: ${r.entry.description.slice(0, 100)}...\n`);
+            }
+            if (cleanedMissing > 0) {
+              console.log(`已自动清理 ${cleanedMissing} 条失效索引。`);
             }
           } catch (error) {
             console.error(`搜索失败: ${String(error)}`);
@@ -242,26 +295,90 @@ const multimodalRagPlugin = {
               offset: Number.parseInt(opts.offset),
             });
 
-            if (entries.length === 0) {
-              console.log("没有找到符合条件的媒体文件");
+            const { existingIds, missingCandidates } = await splitCliExistingAndMissingCandidates(
+              entries.map((e) => ({ id: e.id, filePath: e.filePath })),
+            );
+            let cleanedMissing = 0;
+            if (missingCandidates.length > 0) {
+              const cleanupResult = await storage.cleanupMissingEntries({
+                candidates: missingCandidates,
+                dryRun: false,
+              });
+              cleanedMissing = cleanupResult.removed;
+            }
+            const visibleEntries = entries.filter((e) => existingIds.has(e.id));
+
+            if (visibleEntries.length === 0) {
+              if (cleanedMissing > 0) {
+                console.log(`没有找到符合条件的媒体文件（已自动清理 ${cleanedMissing} 条失效索引）`);
+              } else {
+                console.log("没有找到符合条件的媒体文件");
+              }
               return;
             }
 
             console.log(`已索引 ${total} 个媒体文件:\n`);
-            for (let i = 0; i < entries.length; i++) {
-              const e = entries[i];
+            const offset = Number.parseInt(opts.offset);
+            for (let i = 0; i < visibleEntries.length; i++) {
+              const e = visibleEntries[i];
               const date = new Date(e.fileCreatedAt).toLocaleString("zh-CN");
-              console.log(`${opts.offset + i + 1}. [${e.fileType}] ${e.fileName}`);
+              console.log(`${offset + i + 1}. [${e.fileType}] ${e.fileName}`);
               console.log(`   路径: ${e.filePath}`);
               console.log(`   时间: ${date}`);
               console.log(`   描述: ${e.description.slice(0, 80)}${e.description.length > 80 ? "..." : ""}\n`);
             }
 
-            if (total > opts.offset + entries.length) {
-              console.log(`（显示 ${opts.offset + 1}-${opts.offset + entries.length}，共 ${total} 个）`);
+            if (total > offset + visibleEntries.length) {
+              console.log(`（显示 ${offset + 1}-${offset + visibleEntries.length}，共 ${total} 个）`);
+            }
+            if (cleanedMissing > 0) {
+              console.log(`已自动清理 ${cleanedMissing} 条失效索引。`);
             }
           } catch (error) {
             console.error(`列表失败: ${String(error)}`);
+            process.exit(1);
+          }
+        });
+
+      // openclaw multimodal-rag cleanup-missing
+      rag
+        .command("cleanup-missing")
+        .description("清理索引中“源文件已不存在”的失效记录")
+        .option("--confirm", "确认执行删除（非 dry-run 模式必填）")
+        .option("--dry-run", "仅扫描并显示候选，不实际删除")
+        .option("--limit <n>", "最多扫描条数（默认全部）")
+        .action(async (opts: any) => {
+          const dryRun = !!opts.dryRun;
+          if (!dryRun && !opts.confirm) {
+            console.error("请使用 --confirm 确认清理操作，或使用 --dry-run 仅预览");
+            process.exit(1);
+          }
+
+          let limit: number | undefined;
+          if (opts.limit !== undefined) {
+            limit = Number.parseInt(String(opts.limit), 10);
+            if (!Number.isFinite(limit) || limit <= 0) {
+              console.error("--limit 必须是大于 0 的整数");
+              process.exit(1);
+            }
+          }
+
+          try {
+            const result = await storage.cleanupMissingEntries({
+              dryRun,
+              limit,
+            });
+            if (dryRun) {
+              console.log(
+                `✓ 预览完成：扫描 ${result.scanned} 条，命中缺失 ${result.missing} 条（未执行删除）`,
+              );
+            } else {
+              console.log(
+                `✓ 清理完成：扫描 ${result.scanned} 条，命中缺失 ${result.missing} 条，已删除 ${result.removed} 条`,
+              );
+            }
+          } catch (error) {
+            console.error(`清理失败: ${String(error)}`);
             process.exit(1);
           }
         });

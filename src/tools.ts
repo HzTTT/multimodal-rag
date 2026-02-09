@@ -23,6 +23,11 @@ type UnindexedFile = {
   fileModifiedAt: number;
 };
 
+type IndexedCandidate = {
+  id: string;
+  filePath: string;
+};
+
 /**
  * 扩展路径中的 ~ 为用户主目录
  */
@@ -34,6 +39,42 @@ function expandPath(p: string): string {
     return homedir();
   }
   return p;
+}
+
+function isMissingPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+async function splitExistingAndMissingCandidates(candidates: IndexedCandidate[]): Promise<{
+  existingIds: Set<string>;
+  missingCandidates: IndexedCandidate[];
+}> {
+  const checks = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        await stat(candidate.filePath);
+        return { ...candidate, missing: false };
+      } catch (error) {
+        return {
+          ...candidate,
+          missing: isMissingPathError(error),
+        };
+      }
+    }),
+  );
+
+  const existingIds = new Set<string>();
+  const missingCandidates: IndexedCandidate[] = [];
+  for (const item of checks) {
+    if (item.missing) {
+      missingCandidates.push({ id: item.id, filePath: item.filePath });
+      continue;
+    }
+    existingIds.add(item.id);
+  }
+
+  return { existingIds, missingCandidates };
 }
 
 /**
@@ -200,27 +241,46 @@ export function createMediaSearchTool(
         });
         console.log(`[multimodal-rag] Search returned ${results.length} results`);
 
-        if (results.length === 0) {
+        const { existingIds, missingCandidates } = await splitExistingAndMissingCandidates(
+          results.map((r) => ({ id: r.entry.id, filePath: r.entry.filePath })),
+        );
+        let cleanedMissing = 0;
+        if (missingCandidates.length > 0) {
+          const cleanupResult = await storage.cleanupMissingEntries({
+            candidates: missingCandidates,
+            dryRun: false,
+          });
+          cleanedMissing = cleanupResult.removed;
+          console.log(
+            `[multimodal-rag] Cleaned ${cleanedMissing} missing indexed record(s) in search`,
+          );
+        }
+        const visibleResults = results.filter((r) => existingIds.has(r.entry.id));
+
+        if (visibleResults.length === 0) {
           // 获取媒体库统计
           const totalCount = await storage.count();
+          const cleanupHint =
+            cleanedMissing > 0 ? `\n\n已自动清理 ${cleanedMissing} 条“源文件已删除”的失效索引。` : "";
           return {
             content: [
               {
                 type: "text",
-                text: `未找到与「${query}」相关的媒体文件。\n\n数据库中共有 ${totalCount} 个已索引文件。建议：\n1. 尝试使用更通用的关键词\n2. 使用 media_list 工具浏览所有文件\n3. 调整时间范围（如果设置了 after/before）`,
+                text: `未找到与「${query}」相关的媒体文件。\n\n数据库中共有 ${totalCount} 个已索引文件。建议：\n1. 尝试使用更通用的关键词\n2. 使用 media_list 工具浏览所有文件\n3. 调整时间范围（如果设置了 after/before）${cleanupHint}`,
               },
             ],
             details: {
               count: 0,
               query,
               totalInDatabase: totalCount,
+              cleanedMissing,
               suggestion: "try_broader_keywords_or_use_media_list",
             },
           };
         }
 
       // 格式化结果（提供完整信息）
-      const text = results
+      const text = visibleResults
         .map((r, i) => {
           const date = new Date(r.entry.fileCreatedAt).toLocaleString(
             "zh-CN",
@@ -240,7 +300,7 @@ export function createMediaSearchTool(
         .join("\n\n");
 
       // 清理结果（移除不可序列化的数据）
-      const sanitizedResults = results.map((r) => ({
+      const sanitizedResults = visibleResults.map((r) => ({
         filePath: r.entry.filePath,
         fileName: r.entry.fileName,
         type: r.entry.fileType,
@@ -251,7 +311,7 @@ export function createMediaSearchTool(
       }));
 
       // 计算最高匹配度
-      const maxScore = results[0].score * 100;
+      const maxScore = visibleResults[0].score * 100;
       const confidence =
         maxScore > 60 ? "高" : maxScore > 40 ? "中" : "低";
 
@@ -259,14 +319,15 @@ export function createMediaSearchTool(
         content: [
           {
             type: "text",
-            text: `✅ 找到 ${results.length} 个相关媒体文件（置信度: ${confidence}）：\n\n${text}\n\n⚠️ 立即使用当前聊天渠道对应的方式将上述文件发送给用户！`,
+            text: `✅ 找到 ${visibleResults.length} 个相关媒体文件（置信度: ${confidence}）：\n\n${text}\n\n⚠️ 立即使用当前聊天渠道对应的方式将上述文件发送给用户！`,
           },
         ],
         details: {
-          count: results.length,
+          count: visibleResults.length,
           query,
           maxMatchScore: Number.parseFloat(maxScore.toFixed(1)),
           confidence,
+          cleanedMissing,
           results: sanitizedResults,
         },
       };
@@ -492,7 +553,7 @@ export function createMediaListTool(
       const beforeTs = before ? new Date(before).getTime() : undefined;
 
       // 数据库查询（已索引）
-      const { total: indexedTotal, entries: indexedEntries } = await storage.list({
+      const { entries: indexedEntries } = await storage.list({
         type: type as MediaType | "all",
         after: afterTs,
         before: beforeTs,
@@ -501,7 +562,19 @@ export function createMediaListTool(
         offset: 0,
       });
 
-      const indexedPaths = new Set(indexedEntries.map((e) => e.filePath));
+      const { existingIds, missingCandidates } = await splitExistingAndMissingCandidates(
+        indexedEntries.map((e) => ({ id: e.id, filePath: e.filePath })),
+      );
+      let cleanedMissing = 0;
+      if (missingCandidates.length > 0) {
+        const cleanupResult = await storage.cleanupMissingEntries({
+          candidates: missingCandidates,
+          dryRun: false,
+        });
+        cleanedMissing = cleanupResult.removed;
+      }
+      const validIndexedEntries = indexedEntries.filter((e) => existingIds.has(e.id));
+      const indexedPaths = new Set(validIndexedEntries.map((e) => e.filePath));
 
       // 磁盘兜底（未索引）
       const unindexedFiles: UnindexedFile[] = [];
@@ -538,7 +611,7 @@ export function createMediaListTool(
 
       // 合并结果：统一按 fileCreatedAt 倒序，然后再分页
       const combined = [
-        ...indexedEntries.map((e) => ({
+        ...validIndexedEntries.map((e) => ({
           indexed: true as const,
           filePath: e.filePath,
           fileName: e.fileName,
@@ -563,14 +636,16 @@ export function createMediaListTool(
 
       if (paged.length === 0) {
         const totalCount = await storage.count();
+        const cleanupHint =
+          cleanedMissing > 0 ? `\n\n已自动清理 ${cleanedMissing} 条失效索引。` : "";
         return {
           content: [
             {
               type: "text",
-              text: `没有找到符合条件的媒体文件。\n\n数据库中共有 ${totalCount} 个文件。建议调整过滤条件或使用 media_stats 查看总体情况。`,
+              text: `没有找到符合条件的媒体文件。\n\n数据库中共有 ${totalCount} 个文件。建议调整过滤条件或使用 media_stats 查看总体情况。${cleanupHint}`,
             },
           ],
-          details: { total: 0, totalInDatabase: totalCount, files: [] },
+          details: { total: 0, totalInDatabase: totalCount, cleanedMissing, files: [] },
         };
       }
 
@@ -619,8 +694,9 @@ export function createMediaListTool(
         details: {
           total,
           showing: paged.length,
-          indexedTotal,
+          indexedTotal: validIndexedEntries.length,
           unindexedCount: unindexedFiles.length,
+          cleanedMissing,
           files: sanitizedFiles,
         },
       };

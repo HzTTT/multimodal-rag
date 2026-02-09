@@ -10,7 +10,10 @@ OpenClaw 多模态 RAG 插件 — 使用本地 AI 模型对图像和音频进行
 - **时间过滤**：按文件创建时间范围过滤搜索结果
 - **自动监听**：实时监听文件夹变化，自动索引新增文件
 - **向量存储**：使用 LanceDB 高效存储和检索
-- **智能去重**：基于文件 SHA256 哈希去重
+- **路径级索引**：同内容不同路径分别索引，删除某一路径只影响该路径
+- **搜索去重展示**：`media_search` 默认按内容 hash 去重，避免重复结果淹没输出
+- **强一致清理**：监听删除事件自动移除索引；查询链路会自动清理失效索引
+- **安全原则**：插件不会删除原始图片/音频文件，只会删除索引记录
 - **索引通知**：批次聚合索引事件，仅通过唤醒 agent 生成并回复通知
 
 ## 前置条件
@@ -358,9 +361,22 @@ openclaw multimodal-rag reindex --confirm
 # 清理历史“转录失败”脏音频索引
 openclaw multimodal-rag cleanup-failed-audio --confirm
 
+# 清理“索引存在但源文件已删除”的失效索引
+openclaw multimodal-rag cleanup-missing --dry-run
+openclaw multimodal-rag cleanup-missing --confirm
+
 # 清空索引
 openclaw multimodal-rag clear --confirm
 ```
+
+### 索引一致性与清理策略
+
+- 插件**不会删除原始媒体文件**（图片/音频），仅管理向量索引记录。
+- 当监听到文件被删除（`unlink`）时，会同步硬删除对应索引，避免“幽灵结果”。
+- 若历史上存在“源文件已丢失但索引还在”的脏数据，系统会：
+  - watcher 启动后后台自愈清理一次；
+  - 在 `media_search` / `media_list` / CLI `search` / CLI `list` 查询时做存在性兜底并自动清理。
+- 也可手动执行 `cleanup-missing` 做全量清理。
 
 ## 故障排除
 
@@ -412,6 +428,7 @@ pipx ensurepath
 
 ```bash
 openclaw multimodal-rag cleanup-failed-audio --confirm
+openclaw multimodal-rag cleanup-missing --confirm
 openclaw multimodal-rag reindex --confirm
 ```
 
