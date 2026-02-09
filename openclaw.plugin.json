@@ -82,6 +82,61 @@
         "type": "boolean",
         "default": true,
         "description": "启动时是否索引现有文件"
+      },
+      "notifications": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "启用索引通知（默认唤醒 agent 回复）"
+          },
+          "agentId": {
+            "type": "string",
+            "description": "用于触发通知回复的 agent ID（默认 main）"
+          },
+          "quietWindowMs": {
+            "type": "number",
+            "default": 30000,
+            "description": "静默窗口：最后一个文件处理完后等待多久再发送总结（毫秒）"
+          },
+          "batchTimeoutMs": {
+            "type": "number",
+            "default": 600000,
+            "description": "批次最大超时：超过此时间强制发送总结（毫秒）"
+          },
+          "channel": {
+            "type": "string",
+            "default": "last",
+            "description": "通知渠道（默认 last）"
+          },
+          "to": {
+            "type": "string",
+            "description": "通知目标（可选）"
+          },
+          "targets": {
+            "type": "array",
+            "description": "通知目标列表（用于 agent 的 reply-channel/reply-to）",
+            "items": {
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "type": "string",
+                  "description": "消息渠道（如 feishu / qq / telegram）"
+                },
+                "to": {
+                  "type": "string",
+                  "description": "消息目标（chatId/groupId/uid）"
+                },
+                "accountId": {
+                  "type": "string",
+                  "description": "可选账号 ID（对应 --account）"
+                }
+              }
+            }
+          }
+        },
+        "default": {}
       }
     }
   },
@@ -109,6 +164,40 @@
     "watchDebounceMs": {
       "label": "去抖延迟（毫秒）",
       "advanced": true
+    },
+    "notifications.enabled": {
+      "label": "启用通知",
+      "help": "索引开始/完成时触发通知"
+    },
+    "notifications.agentId": {
+      "label": "通知 Agent ID",
+      "advanced": true,
+      "help": "用于触发通知回复的 agent（默认 main）"
+    },
+    "notifications.quietWindowMs": {
+      "label": "静默窗口（毫秒）",
+      "advanced": true,
+      "help": "最后一个文件处理完后等待多久再发送总结"
+    },
+    "notifications.batchTimeoutMs": {
+      "label": "批次超时（毫秒）",
+      "advanced": true,
+      "help": "超过此时间强制发送总结，防止大批量索引时等太久"
+    },
+    "notifications.channel": {
+      "label": "通知渠道",
+      "advanced": true,
+      "help": "通知渠道（不填则自动取最近活跃会话）"
+    },
+    "notifications.to": {
+      "label": "通知目标",
+      "advanced": true,
+      "help": "通知目标（不填则自动取最近活跃会话）"
+    },
+    "notifications.targets": {
+      "label": "通知目标列表",
+      "advanced": true,
+      "help": "用于通知回复的渠道/目标列表"
     }
   }
 }

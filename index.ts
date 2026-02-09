@@ -9,13 +9,14 @@ import { MediaStorage } from "./src/storage.js";
 import { createEmbeddingProvider } from "./src/embeddings.js";
 import { createMediaProcessor } from "./src/processor.js";
 import { MediaWatcher } from "./src/watcher.js";
+import { IndexNotifier } from "./src/notifier.js";
 import {
   createMediaSearchTool,
   createMediaDescribeTool,
   createMediaListTool,
   createMediaStatsTool,
 } from "./src/tools.js";
-import { runSetup } from "./src/setup.js";
+import { runSetup, runNonInteractiveSetup } from "./src/setup.js";
 import type { PluginConfig } from "./src/types.js";
 
 const multimodalRagPlugin = {
@@ -48,6 +49,15 @@ const multimodalRagPlugin = {
       dbPath: userConfig.dbPath || "~/.openclaw/multimodal-rag.lance",
       watchDebounceMs: userConfig.watchDebounceMs || 1000,
       indexExistingOnStart: userConfig.indexExistingOnStart !== false,
+      notifications: {
+        enabled: userConfig.notifications?.enabled ?? false,
+        agentId: userConfig.notifications?.agentId,
+        quietWindowMs: userConfig.notifications?.quietWindowMs ?? 30000,
+        batchTimeoutMs: userConfig.notifications?.batchTimeoutMs ?? 600000,
+        channel: userConfig.notifications?.channel || "last",
+        to: userConfig.notifications?.to,
+        targets: userConfig.notifications?.targets || [],
+      },
     };
 
     // 解析数据库路径
@@ -76,8 +86,20 @@ const multimodalRagPlugin = {
       visionModel: cfg.ollama.visionModel,
     });
 
+    // 创建通知器（如果启用）
+    let notifier: IndexNotifier | undefined;
+    if (cfg.notifications?.enabled) {
+      notifier = new IndexNotifier(
+        cfg.notifications,
+        api.runtime,
+        api.logger,
+        api.config,
+      );
+      api.logger.info?.("multimodal-rag: Notifications enabled");
+    }
+
     // 创建文件监听器
-    const watcher = new MediaWatcher(cfg, storage, embeddings, processor, api.logger);
+    const watcher = new MediaWatcher(cfg, storage, embeddings, processor, api.logger, notifier);
 
     // ========================================================================
     // 注册工具
@@ -246,6 +268,28 @@ const multimodalRagPlugin = {
 
       // openclaw multimodal-rag clear
       rag
+        .command("cleanup-failed-audio")
+        .description("清理历史转录失败导致的脏音频索引")
+        .option("--confirm", "确认清理")
+        .action(async (opts: any) => {
+          if (!opts.confirm) {
+            console.error("请使用 --confirm 确认清理操作");
+            process.exit(1);
+          }
+
+          try {
+            const result = await storage.cleanupFailedAudioEntries();
+            console.log(
+              `✓ 清理完成：删除 ${result.removed} 条脏音频记录（候选 ${result.candidates} 条）`,
+            );
+          } catch (error) {
+            console.error(`清理失败: ${String(error)}`);
+            process.exit(1);
+          }
+        });
+
+      // openclaw multimodal-rag clear
+      rag
         .command("clear")
         .description("清空索引（谨慎使用）")
         .option("--confirm", "确认清空")
@@ -288,11 +332,60 @@ const multimodalRagPlugin = {
         });
 
       // openclaw multimodal-rag setup
+      // 支持交互式和非交互式两种模式：
+      //   交互式: openclaw multimodal-rag setup
+      //   非交互式: openclaw multimodal-rag setup -n --watch ~/photos --watch ~/audio
       rag
         .command("setup")
-        .description("交互式引导配置插件")
-        .action(async () => {
-          await runSetup();
+        .description("配置插件（支持交互式和非交互式模式）")
+        .option("-n, --non-interactive", "非交互式模式（需配合 --watch 使用）")
+        .option("-w, --watch <paths...>", "监听路径（可多次指定或逗号分隔）")
+        .option("--ollama-url <url>", "Ollama 服务地址", "http://127.0.0.1:11434")
+        .option("--vision-model <model>", "视觉模型名称", "qwen3-vl:2b")
+        .option("--embed-model <model>", "嵌入模型名称", "qwen3-embedding:latest")
+        .option("--embedding-provider <provider>", "嵌入提供者: ollama 或 openai", "ollama")
+        .option("--openai-api-key <key>", "OpenAI API Key（仅 openai 时需要）")
+        .option("--openai-model <model>", "OpenAI 嵌入模型")
+        .option("--db-path <path>", "LanceDB 数据库路径")
+        .option("--no-index-on-start", "启动时不索引已有文件")
+        .option("--notify-enabled", "启用索引完成通知")
+        .option("--notify-quiet-window <ms>", "通知静默窗口（毫秒）", "30000")
+        .option("--notify-batch-timeout <ms>", "通知批次超时（毫秒）", "600000")
+        .action(async (opts: {
+          nonInteractive?: boolean;
+          watch?: string[];
+          ollamaUrl?: string;
+          visionModel?: string;
+          embedModel?: string;
+          embeddingProvider?: string;
+          openaiApiKey?: string;
+          openaiModel?: string;
+          dbPath?: string;
+          noIndexOnStart?: boolean;
+          notifyEnabled?: boolean;
+          notifyQuietWindow?: string;
+          notifyBatchTimeout?: string;
+        }) => {
+          if (opts.nonInteractive) {
+            // 非交互式模式：展开逗号分隔的路径
+            const watchPaths = (opts.watch || []).flatMap((p) => p.split(",").map((s) => s.trim()).filter(Boolean));
+            await runNonInteractiveSetup({
+              watch: watchPaths,
+              ollamaUrl: opts.ollamaUrl,
+              visionModel: opts.visionModel,
+              embedModel: opts.embedModel,
+              embeddingProvider: opts.embeddingProvider as "ollama" | "openai" | undefined,
+              openaiApiKey: opts.openaiApiKey,
+              openaiModel: opts.openaiModel,
+              dbPath: opts.dbPath,
+              noIndexOnStart: opts.noIndexOnStart,
+              notifyEnabled: opts.notifyEnabled,
+              notifyQuietWindowMs: opts.notifyQuietWindow ? Number.parseInt(opts.notifyQuietWindow) : undefined,
+              notifyBatchTimeoutMs: opts.notifyBatchTimeout ? Number.parseInt(opts.notifyBatchTimeout) : undefined,
+            });
+          } else {
+            await runSetup();
+          }
         });
     }, { commands: ["multimodal-rag"] });
 

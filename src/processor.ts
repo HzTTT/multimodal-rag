@@ -4,6 +4,16 @@
 
 import { readFile } from "node:fs/promises";
 import type { IMediaProcessor } from "./types.js";
+import { resolveWhisperBin } from "./whisper-bin.js";
+
+const AUDIO_FAILURE_PATTERN = /^[（(]\s*转录失败[:：]/;
+
+export class AudioTranscriptionError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = "AudioTranscriptionError";
+  }
+}
 
 /**
  * Qwen3-VL 图像处理器
@@ -69,9 +79,9 @@ export class Qwen3VLProcessor implements IMediaProcessor {
    * 处理音频（使用 whisper CLI）
    */
   async processAudio(audioPath: string): Promise<string> {
-    const { exec } = await import("node:child_process");
+    const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
+    const execFileAsync = promisify(execFile);
     const { mkdtemp, rm, readFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { join, basename } = await import("node:path");
@@ -80,12 +90,22 @@ export class Qwen3VLProcessor implements IMediaProcessor {
     const tempDir = await mkdtemp(join(tmpdir(), "whisper-"));
 
     try {
-      // 使用虚拟环境中的 whisper 命令
-      const whisperPath = "/home/lucy/projects/multimodal-rag/venv/bin/whisper";
-      const { stdout, stderr } = await execAsync(
-        `${whisperPath} "${audioPath}" --model base --language zh --output_format txt --output_dir "${tempDir}"`,
-        { maxBuffer: 10 * 1024 * 1024 }, // 10MB buffer
-      );
+      const whisperBin = resolveWhisperBin();
+      const args = [
+        audioPath,
+        "--model",
+        "base",
+        "--language",
+        "zh",
+        "--output_format",
+        "txt",
+        "--output_dir",
+        tempDir,
+      ];
+
+      const { stdout, stderr } = await execFileAsync(whisperBin, args, {
+        maxBuffer: 10 * 1024 * 1024,
+      });
 
       // 读取转录结果（whisper 会创建 .txt 文件）
       const baseFileName = basename(audioPath).replace(/\.[^.]+$/, "");
@@ -94,15 +114,32 @@ export class Qwen3VLProcessor implements IMediaProcessor {
       let transcription: string;
       try {
         transcription = await readFile(txtPath, "utf-8");
-      } catch (err) {
+      } catch {
         // 如果读取失败，尝试从 stdout 获取
-        transcription = stdout || stderr || "转录失败：无输出";
+        transcription = `${stdout || ""}\n${stderr || ""}`.trim();
       }
 
-      return transcription.trim() || "（无音频内容）";
+      const normalized = transcription.trim();
+      if (!normalized) {
+        throw new AudioTranscriptionError("Whisper 未输出有效转录文本");
+      }
+      if (AUDIO_FAILURE_PATTERN.test(normalized)) {
+        throw new AudioTranscriptionError("Whisper 返回了失败标记文本");
+      }
+
+      return normalized;
     } catch (error) {
-      console.error(`Whisper 转录失败: ${String(error)}`);
-      return `（转录失败: ${error instanceof Error ? error.message : String(error)}）`;
+      const err = error as NodeJS.ErrnoException;
+      if (err?.code === "ENOENT") {
+        throw new AudioTranscriptionError(
+          "找不到 whisper 命令，请先安装 whisper 并确保 ffmpeg 可用",
+          error,
+        );
+      }
+      throw new AudioTranscriptionError(
+        `Whisper 转录失败: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+      );
     } finally {
       // 清理临时目录
       try {

@@ -31,6 +31,34 @@ export type MediaSearchResult = {
 };
 
 /**
+ * 通知配置
+ */
+export type NotificationConfig = {
+  enabled: boolean; // 是否启用通知，默认 false
+  agentId?: string; // 用于触发通知回复的 agent，默认 main（或配置中的默认 agent）
+  quietWindowMs: number; // 静默窗口（毫秒），默认 30000
+  batchTimeoutMs: number; // 批次最大超时（毫秒），默认 600000
+  channel?: string; // agent 回复投递渠道，默认 "last"
+  to?: string; // agent 回复投递目标（可选）
+  targets?: Array<{
+    channel: string; // 回复目标渠道（agent --reply-channel）
+    to: string; // 回复目标（agent --reply-to）
+    accountId?: string; // 可选账号（agent --reply-account）
+  }>;
+};
+
+/**
+ * 索引事件回调接口（用于 watcher -> notifier 通信）
+ */
+export type IndexEventCallbacks = {
+  onFileQueued: (filePath: string) => void;
+  onFileIndexed: (filePath: string, fileType: MediaType) => void;
+  onFileSkipped?: (filePath: string, fileType: MediaType, reason?: string) => void;
+  onFileFailed: (filePath: string, error: string) => void;
+  dispose?: () => void;
+};
+
+/**
  * 插件配置
  */
 export type PluginConfig = {
@@ -52,6 +80,7 @@ export type PluginConfig = {
   dbPath: string;
   watchDebounceMs: number;
   indexExistingOnStart: boolean;
+  notifications?: NotificationConfig;
 };
 
 /**

@@ -1,8 +1,8 @@
 /**
- * 交互式引导配置
+ * 引导配置（交互式 & 非交互式）
  *
- * 运行 `openclaw multimodal-rag setup` 时调用，
- * 引导用户完成必要配置并写入 openclaw 配置文件。
+ * 交互式: `openclaw multimodal-rag setup`
+ * 非交互式: `openclaw multimodal-rag setup --watch ~/photos,~/audio --non-interactive`
  */
 
 import * as readline from "node:readline/promises";
@@ -29,6 +29,35 @@ type PluginConfigPartial = {
   };
   dbPath?: string;
   indexExistingOnStart?: boolean;
+  notifications?: {
+    enabled?: boolean;
+    agentId?: string;
+    quietWindowMs?: number;
+    batchTimeoutMs?: number;
+    channel?: string;
+    to?: string;
+    targets?: Array<{
+      channel?: string;
+      to?: string;
+      accountId?: string;
+    }>;
+  };
+};
+
+/** 非交互式 setup 的选项 */
+export type NonInteractiveSetupOpts = {
+  watch: string[];
+  ollamaUrl?: string;
+  visionModel?: string;
+  embedModel?: string;
+  embeddingProvider?: "ollama" | "openai";
+  openaiApiKey?: string;
+  openaiModel?: string;
+  dbPath?: string;
+  noIndexOnStart?: boolean;
+  notifyEnabled?: boolean;
+  notifyQuietWindowMs?: number;
+  notifyBatchTimeoutMs?: number;
 };
 
 function loadOpenClawConfig(): Record<string, unknown> {
@@ -52,6 +81,99 @@ function getExistingPluginConfig(config: Record<string, unknown>): PluginConfigP
   const entries = plugins?.entries as Record<string, unknown> | undefined;
   const entry = entries?.["multimodal-rag"] as Record<string, unknown> | undefined;
   return (entry?.config as PluginConfigPartial) || {};
+}
+
+/**
+ * 将插件配置写入 openclaw.json
+ */
+function writePluginConfig(pluginConfig: PluginConfigPartial): void {
+  const config = loadOpenClawConfig();
+  const plugins = (config.plugins || {}) as Record<string, unknown>;
+  const entries = (plugins.entries || {}) as Record<string, unknown>;
+  const pluginEntry = (entries["multimodal-rag"] || {}) as Record<string, unknown>;
+
+  pluginEntry.enabled = true;
+  pluginEntry.config = pluginConfig;
+
+  entries["multimodal-rag"] = pluginEntry;
+  plugins.entries = entries;
+  config.plugins = plugins;
+
+  saveOpenClawConfig(config);
+}
+
+/**
+ * 非交互式配置
+ *
+ * 适用于脚本自动化、SSH 远程部署等场景。
+ * 所有参数通过命令行选项传入，不读取 stdin。
+ *
+ * 用法:
+ *   openclaw multimodal-rag setup --non-interactive --watch ~/photos,~/audio
+ *   openclaw multimodal-rag setup -n -w ~/photos -w ~/audio --ollama-url http://host:11434
+ */
+export async function runNonInteractiveSetup(opts: NonInteractiveSetupOpts): Promise<void> {
+  if (opts.watch.length === 0) {
+    console.error("✗ 非交互式模式必须通过 --watch 指定至少一个监听路径");
+    console.error("  示例: openclaw multimodal-rag setup --non-interactive --watch ~/photos");
+    process.exit(1);
+  }
+
+  const existing = getExistingPluginConfig(loadOpenClawConfig());
+
+  const pluginConfig: PluginConfigPartial = {
+    watchPaths: opts.watch,
+    ollama: {
+      baseUrl: opts.ollamaUrl || existing.ollama?.baseUrl || "http://127.0.0.1:11434",
+      visionModel: opts.visionModel || existing.ollama?.visionModel || "qwen3-vl:2b",
+      embedModel: opts.embedModel || existing.ollama?.embedModel || "qwen3-embedding:latest",
+    },
+    embedding: {
+      provider: opts.embeddingProvider || existing.embedding?.provider || "ollama",
+      ...(opts.openaiApiKey && { openaiApiKey: opts.openaiApiKey }),
+      ...(opts.openaiModel && { openaiModel: opts.openaiModel }),
+    },
+    dbPath: opts.dbPath || existing.dbPath || "~/.openclaw/multimodal-rag.lance",
+    indexExistingOnStart: opts.noIndexOnStart ? false : (existing.indexExistingOnStart !== false),
+    notifications: {
+      enabled: opts.notifyEnabled ?? existing.notifications?.enabled ?? false,
+      agentId: existing.notifications?.agentId,
+      quietWindowMs: opts.notifyQuietWindowMs ?? existing.notifications?.quietWindowMs ?? 30000,
+      batchTimeoutMs: opts.notifyBatchTimeoutMs ?? existing.notifications?.batchTimeoutMs ?? 600000,
+      channel: existing.notifications?.channel ?? "last",
+      to: existing.notifications?.to,
+      targets: existing.notifications?.targets ?? [],
+    },
+  };
+
+  writePluginConfig(pluginConfig);
+
+  console.log("✓ 配置已保存到 ~/.openclaw/openclaw.json\n");
+  console.log("配置摘要:");
+  console.log(`  监听路径:     ${pluginConfig.watchPaths!.join(", ")}`);
+  console.log(`  Ollama 地址:  ${pluginConfig.ollama!.baseUrl}`);
+  console.log(`  视觉模型:     ${pluginConfig.ollama!.visionModel}`);
+  console.log(`  嵌入模型:     ${pluginConfig.ollama!.embedModel}`);
+  console.log(`  嵌入提供者:   ${pluginConfig.embedding!.provider}`);
+  console.log(`  数据库路径:   ${pluginConfig.dbPath}`);
+  console.log(`  启动时索引:   ${pluginConfig.indexExistingOnStart ? "是" : "否"}`);
+  console.log(`  索引通知:     ${pluginConfig.notifications!.enabled ? "已启用" : "已禁用"}`);
+  if (pluginConfig.notifications!.enabled) {
+    if (pluginConfig.notifications!.agentId) {
+      console.log(`    Agent ID:   ${pluginConfig.notifications!.agentId}`);
+    }
+    console.log(`    静默窗口:   ${pluginConfig.notifications!.quietWindowMs}ms`);
+    console.log(`    批次超时:   ${pluginConfig.notifications!.batchTimeoutMs}ms`);
+    console.log(`    通知渠道:   ${pluginConfig.notifications!.channel || "last"}`);
+    if (pluginConfig.notifications!.to) {
+      console.log(`    通知目标:   ${pluginConfig.notifications!.to}`);
+    }
+    if ((pluginConfig.notifications!.targets?.length ?? 0) > 0) {
+      console.log(`    通知目标:   ${pluginConfig.notifications!.targets!.length} 个`);
+    }
+  }
+  console.log();
+  console.log("提示: 重启 OpenClaw Gateway 以加载新配置");
 }
 
 async function checkOllamaHealth(baseUrl: string): Promise<boolean> {
@@ -94,8 +216,17 @@ export async function runSetup(): Promise<void> {
     embedding: {
       provider: "ollama",
     },
-    dbPath: "/home/lucy/.openclaw/multimodal-rag.lance",
+    dbPath: "~/.openclaw/multimodal-rag.lance",
     indexExistingOnStart: true,
+    notifications: {
+      enabled: existing.notifications?.enabled ?? false,
+      agentId: existing.notifications?.agentId,
+      quietWindowMs: existing.notifications?.quietWindowMs ?? 30000,
+      batchTimeoutMs: existing.notifications?.batchTimeoutMs ?? 600000,
+      channel: existing.notifications?.channel ?? "last",
+      to: existing.notifications?.to,
+      targets: existing.notifications?.targets ?? [],
+    },
   };
 
   // ================================================================
@@ -105,7 +236,7 @@ export async function runSetup(): Promise<void> {
   console.log("设置需要监听的文件夹，插件会自动索引其中的图片和音频文件。");
   console.log("多个路径用逗号分隔，支持 ~ 展开。\n");
 
-  const defaultPaths = existing.watchPaths?.join(", ") || "~/mic-recordings, /home/lucy/usb_data";
+  const defaultPaths = existing.watchPaths?.join(", ") || "~/mic-recordings, ~/usb_data";
   const pathsInput = await rl.question(`监听路径 [${defaultPaths}]: `);
   const watchPaths = (pathsInput.trim() || defaultPaths)
     .split(",")
@@ -148,19 +279,7 @@ export async function runSetup(): Promise<void> {
   // ================================================================
   console.log("\n── 保存配置 ──\n");
 
-  // 深合并到 openclaw 配置
-  const plugins = (config.plugins || {}) as Record<string, unknown>;
-  const entries = (plugins.entries || {}) as Record<string, unknown>;
-  const pluginEntry = (entries["multimodal-rag"] || {}) as Record<string, unknown>;
-
-  pluginEntry.enabled = true;
-  pluginEntry.config = pluginConfig;
-
-  entries["multimodal-rag"] = pluginEntry;
-  plugins.entries = entries;
-  config.plugins = plugins;
-
-  saveOpenClawConfig(config);
+  writePluginConfig(pluginConfig);
 
   console.log("✓ 配置已保存到 ~/.openclaw/openclaw.json\n");
 
@@ -173,6 +292,18 @@ export async function runSetup(): Promise<void> {
   console.log(`  嵌入提供者:   ${pluginConfig.embedding!.provider}`);
   console.log(`  数据库路径:   ${pluginConfig.dbPath}`);
   console.log(`  启动时索引:   ${pluginConfig.indexExistingOnStart ? "是" : "否"}`);
+  console.log(`  索引通知:     ${pluginConfig.notifications!.enabled ? "已启用" : "已禁用"}`);
+  if (pluginConfig.notifications!.enabled) {
+    console.log(`    静默窗口:   ${pluginConfig.notifications!.quietWindowMs}ms`);
+    console.log(`    批次超时:   ${pluginConfig.notifications!.batchTimeoutMs}ms`);
+    console.log(`    通知渠道:   ${pluginConfig.notifications!.channel || "last"}`);
+    if (pluginConfig.notifications!.to) {
+      console.log(`    通知目标:   ${pluginConfig.notifications!.to}`);
+    }
+    if ((pluginConfig.notifications!.targets?.length ?? 0) > 0) {
+      console.log(`    通知目标:   ${pluginConfig.notifications!.targets!.length} 个`);
+    }
+  }
   console.log();
 
   // 前置条件检查

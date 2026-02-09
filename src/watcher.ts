@@ -3,15 +3,24 @@
  */
 
 import chokidar from "chokidar";
-import { stat, readdir } from "node:fs/promises";
-import { basename, extname, resolve, join } from "node:path";
+import { stat, readdir, realpath, readFile, writeFile, mkdir } from "node:fs/promises";
+import { basename, extname, resolve, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import type { MediaType, PluginConfig } from "./types.js";
+import type { MediaType, PluginConfig, IndexEventCallbacks } from "./types.js";
 import type { MediaStorage } from "./storage.js";
 import type { IEmbeddingProvider } from "./types.js";
 import type { IMediaProcessor } from "./types.js";
+
+const AUDIO_FAILURE_PATTERN = /^[（(]\s*转录失败[:：]/;
+const BROKEN_FILES_STATE_SUFFIX = ".broken-files.json";
+
+type BrokenFileRecord = {
+  mtimeMs: number;
+  size: number;
+  error: string;
+  markedAt: number;
+};
 
 /**
  * 扩展路径中的 ~ 为用户主目录
@@ -36,6 +45,8 @@ export class MediaWatcher {
   private processingFilePath: string | null = null;
   private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
   private failedFiles: Map<string, { attempts: number; lastError: string }> = new Map();
+  private brokenFiles: Map<string, BrokenFileRecord> = new Map();
+  private readonly brokenFilesStatePath: string;
   private ollamaHealthy = true;
   private lastOllamaCheck = 0;
 
@@ -45,7 +56,11 @@ export class MediaWatcher {
     private readonly embeddings: IEmbeddingProvider,
     private readonly processor: IMediaProcessor,
     private readonly logger: { info?: (msg: string) => void; warn?: (msg: string) => void },
-  ) {}
+    private readonly callbacks?: IndexEventCallbacks,
+  ) {
+    const resolvedDbPath = resolve(expandPath(this.config.dbPath));
+    this.brokenFilesStatePath = `${resolvedDbPath}${BROKEN_FILES_STATE_SUFFIX}`;
+  }
 
   /**
    * 启动监听
@@ -61,6 +76,8 @@ export class MediaWatcher {
       this.logger.warn?.("No watch paths configured, file watching disabled");
       return;
     }
+
+    await this.loadBrokenFilesState();
 
     // 扩展 ~ 为用户主目录
     const expandedPaths = watchPaths.map(expandPath);
@@ -93,7 +110,7 @@ export class MediaWatcher {
 
       const timer = setTimeout(() => {
         this.debounceTimers.delete(filePath);
-        this.enqueueFile(filePath);
+        void this.enqueueFileWithBrokenFileGuard(filePath);
       }, watchDebounceMs);
 
       this.debounceTimers.set(filePath, timer);
@@ -113,7 +130,7 @@ export class MediaWatcher {
 
       const timer = setTimeout(() => {
         this.debounceTimers.delete(filePath);
-        this.enqueueFile(filePath);
+        void this.enqueueFileWithBrokenFileGuard(filePath);
       }, watchDebounceMs);
 
       this.debounceTimers.set(filePath, timer);
@@ -144,6 +161,8 @@ export class MediaWatcher {
       this.watcher = null;
     }
 
+    this.callbacks?.dispose?.();
+
     // 清理去抖动定时器
     for (const timer of this.debounceTimers.values()) {
       clearTimeout(timer);
@@ -156,7 +175,20 @@ export class MediaWatcher {
    */
   private enqueueFile(filePath: string): void {
     this.processQueue.add(filePath);
+    // 通知回调：文件已入队
+    this.callbacks?.onFileQueued(filePath);
     this.processNextFile();
+  }
+
+  private async enqueueFileWithBrokenFileGuard(filePath: string): Promise<void> {
+    if (await this.shouldSkipBrokenFile(filePath)) {
+      const ext = extname(filePath).toLowerCase();
+      const fileType: MediaType = this.config.fileTypes.image.includes(ext) ? "image" : "audio";
+      this.callbacks?.onFileSkipped?.(filePath, fileType, "broken");
+      this.logger.info?.(`Skipping previously broken file: ${filePath}`);
+      return;
+    }
+    this.enqueueFile(filePath);
   }
 
   /**
@@ -196,7 +228,7 @@ export class MediaWatcher {
   /**
    * 索引单个文件（带错误处理和重试）
    */
-  async indexFile(filePath: string): Promise<void> {
+  async indexFile(filePath: string): Promise<boolean> {
     const ext = extname(filePath).toLowerCase();
     const fileName = basename(filePath);
 
@@ -208,7 +240,13 @@ export class MediaWatcher {
       } else if (this.config.fileTypes.audio.includes(ext)) {
         fileType = "audio";
       } else {
-        return; // 不支持的类型
+        return false; // 不支持的类型
+      }
+
+      if (await this.shouldSkipBrokenFile(filePath)) {
+        this.callbacks?.onFileSkipped?.(filePath, fileType, "broken");
+        this.logger.info?.(`Skipping unchanged broken file: ${fileName}`);
+        return true;
       }
 
       // 检查 Ollama 健康状态
@@ -232,8 +270,9 @@ export class MediaWatcher {
           this.logger.warn?.(
             `Failed to index ${fileName} after 3 attempts: Ollama unavailable`,
           );
+          this.callbacks?.onFileFailed(filePath, "Ollama service unavailable");
         }
-        return;
+        return false;
       }
 
       // 获取文件元数据
@@ -245,9 +284,11 @@ export class MediaWatcher {
       const existing = await this.storage.findByHash(fileHash);
       if (existing) {
         this.logger.info?.(`Skipping duplicate: ${fileName}`);
-        // 索引成功（已存在），清除失败记录
+        // 已存在内容：标记为 skipped，不计入“本次新索引成功数”
         this.failedFiles.delete(filePath);
-        return;
+        await this.clearBrokenFileMark(filePath);
+        this.callbacks?.onFileSkipped?.(filePath, fileType, "duplicate");
+        return true;
       }
 
       // 处理媒体内容
@@ -256,6 +297,10 @@ export class MediaWatcher {
         description = await this.processor.processImage(filePath);
       } else {
         description = await this.processor.processAudio(filePath);
+        // 防御性检查：历史版本可能把失败信息当正常描述写入
+        if (AUDIO_FAILURE_PATTERN.test(description.trim())) {
+          throw new Error("Audio transcription contains failure marker");
+        }
       }
 
       // 生成嵌入向量
@@ -278,6 +323,11 @@ export class MediaWatcher {
       
       // 索引成功，清除失败记录
       this.failedFiles.delete(filePath);
+      await this.clearBrokenFileMark(filePath);
+      
+      // 通知回调：文件索引成功
+      this.callbacks?.onFileIndexed(filePath, fileType);
+      return true;
     } catch (error) {
       const errorMsg = String(error);
       this.logger.warn?.(`Failed to index ${filePath}: ${errorMsg}`);
@@ -291,9 +341,7 @@ export class MediaWatcher {
       // 如果是 Ollama 相关错误且未超过重试次数，稍后重试
       if (
         failedInfo.attempts < 3 &&
-        (errorMsg.includes("Internal Server Error") ||
-          errorMsg.includes("Ollama") ||
-          errorMsg.includes("ECONNREFUSED"))
+        this.isTransientIndexingError(errorMsg)
       ) {
         this.logger.warn?.(
           `Will retry ${fileName} in 60s (attempt ${failedInfo.attempts}/3)`,
@@ -301,7 +349,14 @@ export class MediaWatcher {
         setTimeout(() => {
           this.enqueueFile(filePath);
         }, 60000);
+      } else {
+        if (this.shouldMarkFileAsBroken(errorMsg)) {
+          await this.markFileAsBroken(filePath, errorMsg);
+        }
+        // 达到最大重试次数或非临时错误，通知回调：文件索引失败
+        this.callbacks?.onFileFailed(filePath, errorMsg);
       }
+      return false;
     }
   }
 
@@ -309,7 +364,10 @@ export class MediaWatcher {
    * 手动触发索引（用于初始化或强制重新索引）
    */
   async indexPath(path: string): Promise<void> {
-    await this.indexFile(path);
+    const ok = await this.indexFile(path);
+    if (!ok) {
+      throw new Error(`索引失败: ${path}`);
+    }
   }
 
   /**
@@ -351,12 +409,32 @@ export class MediaWatcher {
     const { entries: indexedFiles } = await this.storage.list({ 
       limit: 10000  // 获取所有文件
     });
-    const indexedPathsSet = new Set(indexedFiles.map(f => f.filePath));
+    const indexedPathsSet = new Set(indexedFiles.map((f) => f.filePath));
+
+    // 用 realpath 归一化，避免因为软链/路径别名导致“已索引文件被误判为缺失”
+    const normalizedIndexedPaths = await Promise.all(
+      indexedFiles.map(async (file) => await this.normalizeComparablePath(file.filePath)),
+    );
+    for (const normalized of normalizedIndexedPaths) {
+      indexedPathsSet.add(normalized);
+    }
+
+    const comparableAllFiles = await Promise.all(
+      allFiles.map(async (filePath) => ({
+        filePath,
+        comparablePath: await this.normalizeComparablePath(filePath),
+      })),
+    );
 
     // 找出缺失的文件
     let missingFiles = 0;
-    for (const filePath of allFiles) {
-      if (!indexedPathsSet.has(filePath)) {
+    let skippedBrokenFiles = 0;
+    for (const { filePath, comparablePath } of comparableAllFiles) {
+      if (!indexedPathsSet.has(filePath) && !indexedPathsSet.has(comparablePath)) {
+        if (await this.shouldSkipBrokenFile(filePath, comparablePath)) {
+          skippedBrokenFiles++;
+          continue;
+        }
         missingFiles++;
         this.enqueueFile(filePath);
       }
@@ -368,6 +446,21 @@ export class MediaWatcher {
       );
     } else {
       this.logger.info?.(`All ${allFiles.length} files are already indexed`);
+    }
+
+    if (skippedBrokenFiles > 0) {
+      this.logger.info?.(
+        `Skipped ${skippedBrokenFiles} unchanged broken file(s) during startup scan`,
+      );
+    }
+  }
+
+  private async normalizeComparablePath(filePath: string): Promise<string> {
+    const resolved = resolve(filePath);
+    try {
+      return await realpath(resolved);
+    } catch {
+      return resolved;
     }
   }
 
@@ -460,5 +553,122 @@ export class MediaWatcher {
     const supportedExts = [...fileTypes.image, ...fileTypes.audio];
 
     await this.scanAndIndexMissingFiles(expandedPaths, supportedExts);
+  }
+
+  private isTransientIndexingError(errorMsg: string): boolean {
+    const normalized = errorMsg.toLowerCase();
+    return (
+      normalized.includes("internal server error") ||
+      normalized.includes("ollama") ||
+      normalized.includes("econnrefused") ||
+      normalized.includes("econnreset") ||
+      normalized.includes("etimedout") ||
+      normalized.includes("fetch failed") ||
+      normalized.includes("timeout") ||
+      normalized.includes("aborted")
+    );
+  }
+
+  private shouldMarkFileAsBroken(errorMsg: string): boolean {
+    return !this.isTransientIndexingError(errorMsg);
+  }
+
+  private async loadBrokenFilesState(): Promise<void> {
+    try {
+      const raw = await readFile(this.brokenFilesStatePath, "utf-8");
+      const parsed = JSON.parse(raw) as Record<string, Partial<BrokenFileRecord>>;
+      this.brokenFiles.clear();
+
+      for (const [filePath, value] of Object.entries(parsed || {})) {
+        if (!value || typeof value !== "object") {
+          continue;
+        }
+        const mtimeMs = Number(value.mtimeMs);
+        const size = Number(value.size);
+        const error = String(value.error ?? "");
+        const markedAt = Number(value.markedAt ?? Date.now());
+        if (!Number.isFinite(mtimeMs) || !Number.isFinite(size)) {
+          continue;
+        }
+        this.brokenFiles.set(filePath, { mtimeMs, size, error, markedAt });
+      }
+
+      if (this.brokenFiles.size > 0) {
+        this.logger.info?.(`Loaded ${this.brokenFiles.size} broken file marker(s)`);
+      }
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err?.code !== "ENOENT") {
+        this.logger.warn?.(`Failed to load broken file markers: ${String(error)}`);
+      }
+    }
+  }
+
+  private async saveBrokenFilesState(): Promise<void> {
+    const output: Record<string, BrokenFileRecord> = {};
+    for (const [filePath, info] of this.brokenFiles.entries()) {
+      output[filePath] = info;
+    }
+
+    await mkdir(dirname(this.brokenFilesStatePath), { recursive: true });
+    await writeFile(
+      this.brokenFilesStatePath,
+      `${JSON.stringify(output, null, 2)}\n`,
+      "utf-8",
+    );
+  }
+
+  private async markFileAsBroken(filePath: string, error: string): Promise<void> {
+    const key = await this.normalizeComparablePath(filePath);
+    let size = 0;
+    let mtimeMs = 0;
+
+    try {
+      const fileStat = await stat(filePath);
+      size = fileStat.size;
+      mtimeMs = fileStat.mtimeMs;
+    } catch {}
+
+    const existing = this.brokenFiles.get(key);
+    if (
+      existing &&
+      existing.size === size &&
+      existing.mtimeMs === mtimeMs &&
+      existing.error === error
+    ) {
+      return;
+    }
+
+    this.brokenFiles.set(key, { size, mtimeMs, error, markedAt: Date.now() });
+    await this.saveBrokenFilesState();
+    this.logger.warn?.(`Marked broken file to skip unchanged retries: ${filePath}`);
+  }
+
+  private async clearBrokenFileMark(filePath: string, normalizedPath?: string): Promise<void> {
+    const key = normalizedPath ?? (await this.normalizeComparablePath(filePath));
+    if (!this.brokenFiles.delete(key)) {
+      return;
+    }
+    await this.saveBrokenFilesState();
+    this.logger.info?.(`Removed broken file marker: ${filePath}`);
+  }
+
+  private async shouldSkipBrokenFile(filePath: string, normalizedPath?: string): Promise<boolean> {
+    const key = normalizedPath ?? (await this.normalizeComparablePath(filePath));
+    const marker = this.brokenFiles.get(key);
+    if (!marker) {
+      return false;
+    }
+
+    try {
+      const fileStat = await stat(filePath);
+      const unchanged = fileStat.size === marker.size && fileStat.mtimeMs === marker.mtimeMs;
+      if (unchanged) {
+        return true;
+      }
+    } catch {}
+
+    await this.clearBrokenFileMark(filePath, key);
+    return false;
   }
 }

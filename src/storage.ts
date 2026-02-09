@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import type { MediaEntry, MediaSearchResult, MediaType } from "./types.js";
 
 const TABLE_NAME = "media";
+const FAILED_AUDIO_DESCRIPTION_PATTERN = /^[（(]\s*转录失败[:：]/;
 
 /**
  * 搜索选项
@@ -363,6 +364,35 @@ export class MediaStorage {
       return allRows.length;
     }
     return allRows.filter((r) => r.fileType === type).length;
+  }
+
+  /**
+   * 清理历史版本写入的音频脏数据（转录失败文本）
+   */
+  async cleanupFailedAudioEntries(): Promise<{ removed: number; candidates: number }> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    const rows = await this.getAllRows();
+    const candidates = rows.filter((row) => {
+      if (row.fileType !== "audio") {
+        return false;
+      }
+      const description = String(row.description ?? "").trim();
+      return FAILED_AUDIO_DESCRIPTION_PATTERN.test(description);
+    });
+
+    let removed = 0;
+    for (const row of candidates) {
+      const id = String(row.id ?? "");
+      if (!id) {
+        continue;
+      }
+      await this.table!.delete(`id = '${id.replace(/'/g, "''")}'`);
+      removed++;
+    }
+
+    return { removed, candidates: candidates.length };
   }
 
   /**
