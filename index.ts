@@ -6,20 +6,21 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { stat } from "node:fs/promises";
-import { MediaStorage } from "./src/storage.js";
-import { createEmbeddingProvider } from "./src/embeddings.js";
-import { createMediaProcessor } from "./src/processor.js";
-import { MediaWatcher } from "./src/watcher.js";
-import { IndexNotifier } from "./src/notifier.js";
 import {
+  createEmbeddingProvider,
+  IndexNotifier,
+  createMediaProcessor,
+  MediaStorage,
+  MediaWatcher,
   createMediaSearchTool,
   createMediaDescribeTool,
   createMediaListTool,
   createMediaStatsTool,
-} from "./src/tools.js";
-import { runSetup, runNonInteractiveSetup } from "./src/setup.js";
-import { resolveWhisperBin } from "./src/whisper-bin.js";
-import type { PluginConfig } from "./src/types.js";
+  runSetup,
+  runNonInteractiveSetup,
+  resolveWhisperBin,
+} from "./plugin-runtime.js";
+import type { PluginConfig } from "./plugin-runtime.js";
 
 function isMissingPathError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException)?.code;

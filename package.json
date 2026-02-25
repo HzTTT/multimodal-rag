@@ -1,6 +1,6 @@
 {
   "name": "@hzttt/multimodal-rag",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "OpenClaw plugin for multimodal RAG - semantic indexing and time-aware search for images and audio using local AI models",
   "type": "module",
   "repository": {
@@ -26,6 +26,7 @@
   "license": "MIT",
   "files": [
     "index.ts",
+    "plugin-runtime.ts",
     "src/",
     "openclaw.plugin.json",
     "README.md"
