@@ -266,23 +266,37 @@ export class MediaStorage {
   }
 
   /**
-   * 通过 hash 查找（去重）
-   * 先尝试 where() 查询（快速路径），失败或无结果时回退到全量扫描
+   * 通过 hash 查找（返回首条）
    */
   async findByHash(fileHash: string): Promise<MediaEntry | null> {
+    const matches = await this.findEntriesByHash(fileHash, 1);
+    return matches[0] ?? null;
+  }
+
+  /**
+   * 通过 hash 查找全部候选条目
+   * 先尝试 where() 查询（快速路径），失败或无结果时回退到全量扫描
+   */
+  async findEntriesByHash(fileHash: string, limit = 1000): Promise<MediaEntry[]> {
     await this.ensureInitialized();
     await this.refreshToLatest();
+
+    const escapedHash = fileHash.replace(/'/g, "''");
+    const safeLimit =
+      typeof limit === "number" && Number.isFinite(limit) && limit > 0
+        ? Math.floor(limit)
+        : 1000;
 
     // 快速路径：where 查询
     try {
       const results = await this.table!
         .query()
-        .where("`fileHash` = '" + fileHash + "'")
-        .limit(1)
+        .where("`fileHash` = '" + escapedHash + "'")
+        .limit(safeLimit)
         .toArray();
 
       if (results && results.length > 0) {
-        return this.rowToFullEntry(results[0]);
+        return results.map((row) => this.rowToFullEntry(row));
       }
     } catch {
       // where 查询失败，回退到全量扫描
@@ -290,8 +304,11 @@ export class MediaStorage {
 
     // 回退：全量扫描（处理 LanceDB fragment 不一致问题）
     const allRows = await this.getAllRows();
-    const row = allRows.find((r) => r.fileHash === fileHash);
-    return row ? this.rowToFullEntry(row) : null;
+    const filtered = allRows
+      .filter((row) => row.fileHash === fileHash)
+      .slice(0, safeLimit)
+      .map((row) => this.rowToFullEntry(row));
+    return filtered;
   }
 
   /**

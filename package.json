@@ -1,6 +1,6 @@
 {
   "name": "@hzttt/multimodal-rag",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "OpenClaw plugin for multimodal RAG - semantic indexing and time-aware search for images and audio using local AI models",
   "type": "module",
   "repository": {
@@ -8,8 +8,11 @@
     "url": "https://github.com/hzttt/multimodal-rag.git"
   },
   "scripts": {
-    "build": "tsc",
-    "test": "node test/test-embedding.js"
+    "sync:version": "node scripts/sync-version.mjs",
+    "build": "npm run sync:version && tsc",
+    "test": "node test/test-embedding.js",
+    "prepack": "npm run sync:version",
+    "version": "npm run sync:version && git add openclaw.plugin.json"
   },
   "keywords": [
     "openclaw",

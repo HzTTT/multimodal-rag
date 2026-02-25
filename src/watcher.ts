@@ -7,19 +7,42 @@ import { stat, readdir, realpath, readFile, writeFile, mkdir } from "node:fs/pro
 import { basename, extname, resolve, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import type { MediaType, PluginConfig, IndexEventCallbacks } from "./types.js";
+import type {
+  MediaType,
+  PluginConfig,
+  IndexEventCallbacks,
+  MediaEntry,
+  IEmbeddingProvider,
+  IMediaProcessor,
+} from "./types.js";
 import type { MediaStorage } from "./storage.js";
-import type { IEmbeddingProvider } from "./types.js";
-import type { IMediaProcessor } from "./types.js";
 
 const AUDIO_FAILURE_PATTERN = /^[（(]\s*转录失败[:：]/;
 const BROKEN_FILES_STATE_SUFFIX = ".broken-files.json";
+const RECENTLY_DELETED_ENTRY_TTL_MS = 60_000;
 
 type BrokenFileRecord = {
   mtimeMs: number;
   size: number;
   error: string;
   markedAt: number;
+};
+
+type RecentlyDeletedEntrySnapshot = {
+  entry: MediaEntry;
+  deletedAt: number;
+  sourcePath: string;
+};
+
+type MovedSourceCandidate = {
+  entry: MediaEntry;
+  source: "cache" | "storage";
+};
+
+type FileStatSnapshot = {
+  size: number;
+  mtimeMs: number;
+  birthtimeMs: number;
 };
 
 /**
@@ -47,6 +70,8 @@ export class MediaWatcher {
   private retryTimers: Set<NodeJS.Timeout> = new Set();
   private failedFiles: Map<string, { attempts: number; lastError: string }> = new Map();
   private brokenFiles: Map<string, BrokenFileRecord> = new Map();
+  private recentlyDeletedEntriesByHash: Map<string, RecentlyDeletedEntrySnapshot[]> = new Map();
+  private readonly recentlyDeletedEntryTtlMs = RECENTLY_DELETED_ENTRY_TTL_MS;
   private readonly brokenFilesStatePath: string;
   private ollamaHealthy = true;
   private lastOllamaCheck = 0;
@@ -188,6 +213,7 @@ export class MediaWatcher {
     this.retryTimers.clear();
     this.processQueue.clear();
     this.failedFiles.clear();
+    this.recentlyDeletedEntriesByHash.clear();
     this.processing = false;
     this.processingFilePath = null;
   }
@@ -214,13 +240,24 @@ export class MediaWatcher {
   }
 
   private async handleFileDeleted(filePath: string): Promise<void> {
+    this.pruneRecentlyDeletedEntries();
+    const ext = extname(filePath).toLowerCase();
+    const fileType: MediaType = this.config.fileTypes.image.includes(ext) ? "image" : "audio";
     const timer = this.debounceTimers.get(filePath);
     if (timer) {
       clearTimeout(timer);
       this.debounceTimers.delete(filePath);
     }
-    this.processQueue.delete(filePath);
+    const removedFromQueue = this.processQueue.delete(filePath);
     this.failedFiles.delete(filePath);
+    if (removedFromQueue) {
+      this.callbacks?.onFileSkipped?.(filePath, fileType, "deleted");
+    }
+
+    const indexedEntry = await this.storage.findByPath(filePath);
+    if (indexedEntry) {
+      this.rememberRecentlyDeletedEntry(indexedEntry, filePath);
+    }
 
     const removed = await this.removeIndexedEntryForDeletedFile(filePath);
     if (removed > 0) {
@@ -258,6 +295,94 @@ export class MediaWatcher {
       return "ollama";
     }
     return "unknown";
+  }
+
+  private pruneRecentlyDeletedEntries(now = Date.now()): void {
+    for (const [fileHash, snapshots] of this.recentlyDeletedEntriesByHash.entries()) {
+      const validSnapshots = snapshots.filter(
+        (snapshot) => now - snapshot.deletedAt <= this.recentlyDeletedEntryTtlMs,
+      );
+      if (validSnapshots.length === 0) {
+        this.recentlyDeletedEntriesByHash.delete(fileHash);
+        continue;
+      }
+      this.recentlyDeletedEntriesByHash.set(fileHash, validSnapshots);
+    }
+  }
+
+  private rememberRecentlyDeletedEntry(entry: MediaEntry, sourcePath: string): void {
+    if (!entry.fileHash) {
+      return;
+    }
+    const snapshots = this.recentlyDeletedEntriesByHash.get(entry.fileHash) ?? [];
+    snapshots.push({
+      entry,
+      deletedAt: Date.now(),
+      sourcePath,
+    });
+    this.recentlyDeletedEntriesByHash.set(entry.fileHash, snapshots);
+  }
+
+  private consumeRecentlyDeletedEntry(fileHash: string, entryId: string, sourcePath: string): void {
+    const snapshots = this.recentlyDeletedEntriesByHash.get(fileHash);
+    if (!snapshots || snapshots.length === 0) {
+      return;
+    }
+    const nextSnapshots = snapshots.filter(
+      (snapshot) => snapshot.entry.id !== entryId && snapshot.sourcePath !== sourcePath,
+    );
+    if (nextSnapshots.length === 0) {
+      this.recentlyDeletedEntriesByHash.delete(fileHash);
+      return;
+    }
+    this.recentlyDeletedEntriesByHash.set(fileHash, nextSnapshots);
+  }
+
+  private async isPathMissing(filePath: string): Promise<boolean> {
+    try {
+      await stat(filePath);
+      return false;
+    } catch (error) {
+      if (this.isFileMissingError(error)) {
+        return true;
+      }
+      return false;
+    }
+  }
+
+  private async findMovedSourceByHash(
+    fileHash: string,
+    fileType: MediaType,
+  ): Promise<MovedSourceCandidate | null> {
+    this.pruneRecentlyDeletedEntries();
+
+    const cachedCandidates = this.recentlyDeletedEntriesByHash.get(fileHash) ?? [];
+    for (let i = cachedCandidates.length - 1; i >= 0; i--) {
+      const candidate = cachedCandidates[i];
+      if (candidate.entry.fileType !== fileType) {
+        continue;
+      }
+      if (await this.isPathMissing(candidate.entry.filePath)) {
+        return {
+          entry: candidate.entry,
+          source: "cache",
+        };
+      }
+    }
+
+    const indexedCandidates = await this.storage.findEntriesByHash(fileHash);
+    for (const candidate of indexedCandidates) {
+      if (candidate.fileType !== fileType) {
+        continue;
+      }
+      if (await this.isPathMissing(candidate.filePath)) {
+        return {
+          entry: candidate,
+          source: "storage",
+        };
+      }
+    }
+    return null;
   }
 
   private scheduleRetry(filePath: string, delayMs: number): void {
@@ -307,6 +432,52 @@ export class MediaWatcher {
         this.processNextFile();
       }
     }
+  }
+
+  private async reuseMovedEntryWithoutReindex(params: {
+    filePath: string;
+    fileName: string;
+    fileType: MediaType;
+    fileHash: string;
+    stats: FileStatSnapshot;
+    source: MovedSourceCandidate;
+    startedAt: number;
+  }): Promise<void> {
+    const { filePath, fileName, fileType, fileHash, stats, source, startedAt } = params;
+    const sourceEntry = source.entry;
+
+    if (sourceEntry.filePath !== filePath) {
+      try {
+        await this.storage.delete(sourceEntry.id);
+      } catch {
+        await this.storage.deleteByPath(sourceEntry.filePath);
+      }
+    }
+
+    await this.storage.replaceByPath({
+      filePath,
+      fileName,
+      fileType,
+      description: sourceEntry.description,
+      vector: sourceEntry.vector,
+      fileHash,
+      fileSize: stats.size,
+      fileCreatedAt: stats.birthtimeMs || stats.mtimeMs,
+      fileModifiedAt: stats.mtimeMs,
+    });
+
+    this.consumeRecentlyDeletedEntry(fileHash, sourceEntry.id, sourceEntry.filePath);
+    this.failedFiles.delete(filePath);
+    await this.clearBrokenFileMark(filePath);
+    this.callbacks?.onFileSkipped?.(filePath, fileType, "moved");
+
+    this.logEvent("info", "index_file_moved_reused", {
+      filePath,
+      fileType,
+      reusedFromPath: sourceEntry.filePath,
+      source: source.source,
+      durationMs: Date.now() - startedAt,
+    });
   }
 
   /**
@@ -406,6 +577,22 @@ export class MediaWatcher {
         await this.clearBrokenFileMark(filePath);
         this.callbacks?.onFileSkipped?.(filePath, fileType, "metadata-updated");
         return true;
+      }
+
+      if (!existingByPath) {
+        const movedSource = await this.findMovedSourceByHash(fileHash, fileType);
+        if (movedSource) {
+          await this.reuseMovedEntryWithoutReindex({
+            filePath,
+            fileName,
+            fileType,
+            fileHash,
+            stats,
+            source: movedSource,
+            startedAt,
+          });
+          return true;
+        }
       }
 
       // 处理媒体内容
@@ -721,6 +908,7 @@ export class MediaWatcher {
     // 清空处理队列和失败记录
     this.processQueue.clear();
     this.failedFiles.clear();
+    this.recentlyDeletedEntriesByHash.clear();
 
     // 重新扫描所有文件
     const { watchPaths, fileTypes } = this.config;

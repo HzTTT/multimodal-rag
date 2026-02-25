@@ -33,17 +33,16 @@ type RootConfigCompat = MainSessionConfig;
  * IndexNotifier 负责聚合索引事件并触发 agent 通知
  * 
  * 工作流程:
- * 1. 首个文件入队 -> 开始批次聚合（暂不立即通知）
- * 2. 首个 indexed/failed 结果出现 -> 发送"开始索引"通知
- * 3. 持续聚合文件状态，重置静默计时器
- * 4. 静默窗口到期且无待处理文件 -> 若有 indexed/failed 结果则发送"索引完成总结"通知
+ * 1. 首个文件入队 -> 开始批次聚合，并立即发送"开始索引"通知
+ * 2. 持续聚合文件状态
+ * 3. 当批次内最后一个 queued 文件完成（无 queued）-> 立即发送"索引完成总结"通知
+ * 4. 若出现异常卡住，依赖 batchTimeout 兜底完成批次
  */
 export class IndexNotifier implements IndexEventCallbacks {
   private state: "idle" | "batching" = "idle";
   private batch: Map<string, BatchFile> = new Map();
   private batchStartTime = 0;
   private startNotificationSent = false;
-  private quietTimer: NodeJS.Timeout | null = null;
   private batchTimeoutTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -79,7 +78,7 @@ export class IndexNotifier implements IndexEventCallbacks {
       }, this.config.batchTimeoutMs);
     }
 
-    this.resetQuietTimer();
+    this.maybeSendStartNotification();
   }
 
   /**
@@ -90,8 +89,7 @@ export class IndexNotifier implements IndexEventCallbacks {
       return;
     }
     this.batch.set(filePath, { status: "indexed", fileType });
-    this.maybeSendStartNotification();
-    this.resetQuietTimer();
+    this.maybeFinalizeBatchIfSettled();
   }
 
   /**
@@ -102,7 +100,7 @@ export class IndexNotifier implements IndexEventCallbacks {
       return;
     }
     this.batch.set(filePath, { status: "skipped", fileType });
-    this.resetQuietTimer();
+    this.maybeFinalizeBatchIfSettled();
   }
 
   /**
@@ -113,30 +111,7 @@ export class IndexNotifier implements IndexEventCallbacks {
       return;
     }
     this.batch.set(filePath, { status: "failed", error });
-    this.maybeSendStartNotification();
-    this.resetQuietTimer();
-  }
-
-  /**
-   * 重置静默窗口计时器
-   */
-  private resetQuietTimer(): void {
-    if (this.quietTimer) {
-      clearTimeout(this.quietTimer);
-    }
-
-    this.quietTimer = setTimeout(() => {
-      // 检查是否还有文件在处理中
-      const hasQueued = [...this.batch.values()].some((f) => f.status === "queued");
-
-      if (!hasQueued) {
-        // 所有文件都处理完了，发送总结
-        this.finalizeBatch();
-      } else {
-        // 还有文件在排队，继续等
-        this.resetQuietTimer();
-      }
-    }, this.config.quietWindowMs);
+    this.maybeFinalizeBatchIfSettled();
   }
 
   /**
@@ -148,10 +123,10 @@ export class IndexNotifier implements IndexEventCallbacks {
     }
 
     this.clearTimers();
-    if (this.hasMeaningfulResults()) {
+    if (this.batch.size > 0 && (this.hasMeaningfulResults() || this.startNotificationSent)) {
       this.triggerAgent(this.buildSummaryMessage());
     } else {
-      this.logger.info?.("Skip notification: batch only contains skipped files");
+      this.logger.info?.("Skip notification: empty batch");
     }
 
     // 重置状态
@@ -169,6 +144,16 @@ export class IndexNotifier implements IndexEventCallbacks {
     this.triggerAgent(this.buildStartMessage());
   }
 
+  private maybeFinalizeBatchIfSettled(): void {
+    if (this.state !== "batching") {
+      return;
+    }
+    const hasQueued = [...this.batch.values()].some((f) => f.status === "queued");
+    if (!hasQueued) {
+      this.finalizeBatch();
+    }
+  }
+
   private hasMeaningfulResults(): boolean {
     for (const file of this.batch.values()) {
       if (file.status === "indexed" || file.status === "failed") {
@@ -182,10 +167,6 @@ export class IndexNotifier implements IndexEventCallbacks {
    * 清理所有计时器
    */
   private clearTimers(): void {
-    if (this.quietTimer) {
-      clearTimeout(this.quietTimer);
-      this.quietTimer = null;
-    }
     if (this.batchTimeoutTimer) {
       clearTimeout(this.batchTimeoutTimer);
       this.batchTimeoutTimer = null;

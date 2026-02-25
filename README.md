@@ -226,7 +226,7 @@ openclaw multimodal-rag setup -n \
 | `indexExistingOnStart`       | boolean  | `true`                             | 启动时是否索引已有文件                            |
 | `notifications.enabled`      | boolean  | `false`                            | 启用索引完成通知（默认唤醒 agent 回复）         |
 | `notifications.agentId`      | string   | `"main"`                           | 通知触发使用的 agent ID（会沿用该 agent 的性格/身份设定） |
-| `notifications.quietWindowMs` | number   | `30000`                            | 静默窗口：最后一个文件处理完后等待多久再发送总结（毫秒）         |
+| `notifications.quietWindowMs` | number   | `30000`                            | 兼容保留参数（当前完成通知按“队列清空 + 无处理中”即时触发）         |
 | `notifications.batchTimeoutMs` | number   | `600000`                           | 批次最大超时：超过此时间强制发送总结（毫秒），防止大批量索引时等太久 |
 | `notifications.channel`      | string   | `"last"`                           | 通知渠道（未配置 `targets` 时使用）                      |
 | `notifications.to`           | string   | -                                  | 通知目标（未配置 `targets` 时使用）                      |
@@ -243,9 +243,9 @@ openclaw multimodal-rag setup -n \
 
 #### 工作原理
 
-1. **开始通知**：检测到第一个新文件时，插件默认用 `openclaw agent --deliver` 唤醒 agent 生成回复并发送
+1. **开始通知**：检测到第一个新文件入队时，插件默认用 `openclaw agent --deliver` 唤醒 agent 生成回复并发送
 2. **批次聚合**：持续聚合多个文件的索引状态，避免频繁通知
-3. **完成通知**：所有文件处理完成后（静默窗口到期），插件再次触发 agent 发送总结
+3. **完成通知**：当本轮无正在处理文件且队列为空时，立即触发 agent 发送总结
 
 #### 通知示例
 
