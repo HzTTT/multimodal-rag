@@ -7,7 +7,18 @@ import type { MediaType, NotificationConfig, IndexEventCallbacks } from "./types
 
 type BatchFileStatus = "queued" | "indexed" | "skipped" | "failed";
 type BatchFile = { status: BatchFileStatus; fileType?: MediaType; error?: string };
-type MainSessionConfig = Parameters<PluginRuntime["system"]["resolveMainSessionKey"]>[0];
+type AgentConfigEntry = {
+  id?: string;
+  default?: boolean;
+};
+type MainSessionConfig = {
+  agents?: {
+    list?: AgentConfigEntry[];
+  };
+  session?: {
+    store?: string;
+  };
+};
 type RuntimeSystemCompat = {
   runCommandWithTimeout?: PluginRuntime["system"]["runCommandWithTimeout"];
 };
@@ -16,11 +27,7 @@ type NotificationTargetResolved = {
   to: string;
   accountId?: string;
 };
-type RootConfigCompat = MainSessionConfig & {
-  session?: {
-    store?: string;
-  };
-};
+type RootConfigCompat = MainSessionConfig;
 
 /**
  * IndexNotifier 负责聚合索引事件并触发 agent 通知

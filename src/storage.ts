@@ -502,6 +502,7 @@ export class MediaStorage {
   async cleanupMissingEntries(
     options: CleanupMissingOptions = {},
   ): Promise<CleanupMissingResult> {
+    const startedAt = Date.now();
     await this.ensureInitialized();
     await this.refreshToLatest();
 
@@ -548,12 +549,26 @@ export class MediaStorage {
       }
     }
 
-    return {
+    const result = {
       scanned,
       missing: uniqueMissingIds.length,
       removed,
       missingIds: uniqueMissingIds,
     };
+    const durationMs = Date.now() - startedAt;
+    const hitRate = scanned > 0 ? result.missing / scanned : 0;
+    console.info(
+      JSON.stringify({
+        event: "cleanup_missing_entries_completed",
+        scanned: result.scanned,
+        missing: result.missing,
+        removed: result.removed,
+        durationMs,
+        hitRate: Number.parseFloat(hitRate.toFixed(4)),
+        dryRun,
+      }),
+    );
+    return result;
   }
 
   private async isPathMissing(filePath: string): Promise<boolean> {

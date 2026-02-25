@@ -4,6 +4,7 @@
 
 import { Type } from "@sinclair/typebox";
 import { readdir, stat } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
 import type { MediaStorage } from "./storage.js";
@@ -27,6 +28,40 @@ type IndexedCandidate = {
   id: string;
   filePath: string;
 };
+
+function makeTextContent(text: string): Array<{ type: "text"; text: string }> {
+  return [{ type: "text", text }];
+}
+
+function parseIsoDate(value: unknown, field: string): { value?: number; error?: string } {
+  if (value === undefined || value === null || value === "") {
+    return { value: undefined };
+  }
+  if (typeof value !== "string") {
+    return { error: `${field} 必须是 ISO 日期字符串` };
+  }
+  const ts = new Date(value).getTime();
+  if (!Number.isFinite(ts)) {
+    return { error: `${field} 不是合法日期，示例：2026-02-05T23:59:59` };
+  }
+  return { value: ts };
+}
+
+function parsePositiveInt(
+  value: unknown,
+  field: string,
+  options: { min?: number; defaultValue: number },
+): { value: number; error?: string } {
+  const { min = 1, defaultValue } = options;
+  if (value === undefined || value === null || value === "") {
+    return { value: defaultValue };
+  }
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min) {
+    return { value: defaultValue, error: `${field} 必须是 >= ${min} 的整数` };
+  }
+  return { value: n };
+}
 
 /**
  * 扩展路径中的 ~ 为用户主目录
@@ -105,7 +140,7 @@ async function scanDirectoryForMediaFiles(options: {
       return;
     }
 
-    let entries: Awaited<ReturnType<typeof readdir>>;
+    let entries: Dirent[];
     try {
       entries = await readdir(p, { withFileTypes: true });
     } catch {
@@ -210,9 +245,49 @@ export function createMediaSearchTool(
     }),
     async execute(_toolCallId: string, params: any) {
       const { query, type = "all", after, before, limit = 5 } = params;
+      const normalizedQuery = typeof query === "string" ? query.trim() : "";
+      if (!normalizedQuery) {
+        return {
+          content: makeTextContent("query 不能为空，请提供搜索关键词。"),
+          details: { count: 0, error: "invalid_query" },
+        };
+      }
+
+      const parsedAfter = parseIsoDate(after, "after");
+      if (parsedAfter.error) {
+        return {
+          content: makeTextContent(parsedAfter.error),
+          details: { count: 0, error: "invalid_after" },
+        };
+      }
+      const parsedBefore = parseIsoDate(before, "before");
+      if (parsedBefore.error) {
+        return {
+          content: makeTextContent(parsedBefore.error),
+          details: { count: 0, error: "invalid_before" },
+        };
+      }
+      if (
+        parsedAfter.value !== undefined &&
+        parsedBefore.value !== undefined &&
+        parsedAfter.value > parsedBefore.value
+      ) {
+        return {
+          content: makeTextContent("after 不能晚于 before。"),
+          details: { count: 0, error: "invalid_date_range" },
+        };
+      }
+
+      const parsedLimit = parsePositiveInt(limit, "limit", { min: 1, defaultValue: 5 });
+      if (parsedLimit.error) {
+        return {
+          content: makeTextContent(parsedLimit.error),
+          details: { count: 0, error: "invalid_limit" },
+        };
+      }
 
       // 调试日志
-      console.log(`[multimodal-rag] media_search called with query: "${query}"`);
+      console.log(`[multimodal-rag] media_search called with query: "${normalizedQuery}"`);
       console.log(
         `[multimodal-rag] embeddings provider available: ${!!embeddings}`,
       );
@@ -220,23 +295,23 @@ export function createMediaSearchTool(
 
       try {
         // 生成查询向量
-        console.log(`[multimodal-rag] Generating embedding for: "${query}"`);
-        const vector = await embeddings.embed(query);
+        console.log(`[multimodal-rag] Generating embedding for: "${normalizedQuery}"`);
+        const vector = await embeddings.embed(normalizedQuery);
         console.log(
           `[multimodal-rag] Embedding generated, dimension: ${vector?.length}`,
         );
 
         // 解析时间参数
-        const afterTs = after ? new Date(after).getTime() : undefined;
-        const beforeTs = before ? new Date(before).getTime() : undefined;
+        const afterTs = parsedAfter.value;
+        const beforeTs = parsedBefore.value;
 
         // 搜索（降低阈值以提高召回）
-        console.log(`[multimodal-rag] Searching with options: type=${type}, after=${afterTs}, before=${beforeTs}, limit=${limit}`);
+        console.log(`[multimodal-rag] Searching with options: type=${type}, after=${afterTs}, before=${beforeTs}, limit=${parsedLimit.value}`);
         const results = await storage.search(vector, {
           type: type as MediaType | "all",
           after: afterTs,
           before: beforeTs,
-          limit,
+          limit: parsedLimit.value,
           minScore: 0.25, // 降低阈值：25% 以上即返回
         });
         console.log(`[multimodal-rag] Search returned ${results.length} results`);
@@ -263,15 +338,12 @@ export function createMediaSearchTool(
           const cleanupHint =
             cleanedMissing > 0 ? `\n\n已自动清理 ${cleanedMissing} 条“源文件已删除”的失效索引。` : "";
           return {
-            content: [
-              {
-                type: "text",
-                text: `未找到与「${query}」相关的媒体文件。\n\n数据库中共有 ${totalCount} 个已索引文件。建议：\n1. 尝试使用更通用的关键词\n2. 使用 media_list 工具浏览所有文件\n3. 调整时间范围（如果设置了 after/before）${cleanupHint}`,
-              },
-            ],
+            content: makeTextContent(
+              `未找到与「${normalizedQuery}」相关的媒体文件。\n\n数据库中共有 ${totalCount} 个已索引文件。建议：\n1. 尝试使用更通用的关键词\n2. 使用 media_list 工具浏览所有文件\n3. 调整时间范围（如果设置了 after/before）${cleanupHint}`,
+            ),
             details: {
               count: 0,
-              query,
+              query: normalizedQuery,
               totalInDatabase: totalCount,
               cleanedMissing,
               suggestion: "try_broader_keywords_or_use_media_list",
@@ -316,15 +388,12 @@ export function createMediaSearchTool(
         maxScore > 60 ? "高" : maxScore > 40 ? "中" : "低";
 
       return {
-        content: [
-          {
-            type: "text",
-            text: `✅ 找到 ${visibleResults.length} 个相关媒体文件（置信度: ${confidence}）：\n\n${text}\n\n⚠️ 立即使用当前聊天渠道对应的方式将上述文件发送给用户！`,
-          },
-        ],
+        content: makeTextContent(
+          `✅ 找到 ${visibleResults.length} 个相关媒体文件（置信度: ${confidence}）：\n\n${text}\n\n⚠️ 立即使用当前聊天渠道对应的方式将上述文件发送给用户！`,
+        ),
         details: {
           count: visibleResults.length,
-          query,
+          query: normalizedQuery,
           maxMatchScore: Number.parseFloat(maxScore.toFixed(1)),
           confidence,
           cleanedMissing,
@@ -333,18 +402,15 @@ export function createMediaSearchTool(
       };
       } catch (error) {
         // 错误处理：embedding 或搜索失败时返回友好信息
-        console.error(`[multimodal-rag] Search error for query "${query}":`, error);
+        console.error(`[multimodal-rag] Search error for query "${normalizedQuery}":`, error);
         const totalCount = await storage.count().catch(() => 0);
         return {
-          content: [
-            {
-              type: "text",
-              text: `搜索时遇到技术问题，请稍后重试。\n\n数据库中共有 ${totalCount} 个已索引文件。\n错误详情: ${error instanceof Error ? error.message : String(error)}`,
-            },
-          ],
+          content: makeTextContent(
+            `搜索时遇到技术问题，请稍后重试。\n\n数据库中共有 ${totalCount} 个已索引文件。\n错误详情: ${error instanceof Error ? error.message : String(error)}`,
+          ),
           details: {
             count: 0,
-            query,
+            query: normalizedQuery,
             error: error instanceof Error ? error.message : String(error),
             totalInDatabase: totalCount,
           },
@@ -359,8 +425,8 @@ export function createMediaSearchTool(
  */
 export function createMediaDescribeTool(
   storage: MediaStorage,
-  processor: IMediaProcessor,
-  embeddings: IEmbeddingProvider,
+  _processor: IMediaProcessor,
+  _embeddings: IEmbeddingProvider,
   watcher: MediaWatcher,
 ) {
   return {
@@ -381,23 +447,27 @@ export function createMediaDescribeTool(
     }),
     async execute(_toolCallId: string, params: any) {
       const { filePath, refresh = false } = params;
+      const normalizedPath = typeof filePath === "string" ? filePath.trim() : "";
+      if (!normalizedPath) {
+        return {
+          content: makeTextContent("filePath 不能为空"),
+          details: { error: "invalid_file_path" },
+        };
+      }
 
       // 查找现有记录
-      let entry = await storage.findByPath(filePath);
+      let entry = await storage.findByPath(normalizedPath);
 
       if (!entry || refresh) {
         // 需要重新索引
-        await watcher.indexPath(filePath);
-        entry = await storage.findByPath(filePath);
+        await watcher.indexPath(normalizedPath);
+        entry = await storage.findByPath(normalizedPath);
 
         if (!entry) {
           return {
-            content: [
-              {
-                type: "text",
-                text: `无法索引文件: ${filePath}。请检查文件是否存在且为支持的格式。`,
-              },
-            ],
+            content: makeTextContent(
+              `无法索引文件: ${normalizedPath}。请检查文件是否存在且为支持的格式。`,
+            ),
             details: { error: "indexing_failed" },
           };
         }
@@ -407,12 +477,9 @@ export function createMediaDescribeTool(
       const indexedDate = new Date(entry.indexedAt).toLocaleString("zh-CN");
 
       return {
-        content: [
-          {
-            type: "text",
-            text: `文件: ${entry.fileName}\n类型: ${entry.fileType}\n路径: ${entry.filePath}\n创建时间: ${date}\n索引时间: ${indexedDate}\n\n描述:\n${entry.description}`,
-          },
-        ],
+        content: makeTextContent(
+          `文件: ${entry.fileName}\n类型: ${entry.fileType}\n路径: ${entry.filePath}\n创建时间: ${date}\n索引时间: ${indexedDate}\n\n描述:\n${entry.description}`,
+        ),
         details: {
           filePath: entry.filePath,
           fileName: entry.fileName,
@@ -444,33 +511,25 @@ export function createMediaStatsTool(storage: MediaStorage, watcher?: MediaWatch
 
       if (total === 0) {
         return {
-          content: [
-            {
-              type: "text",
-              text:
-                "媒体库为空。\n\n" +
-                (queue
-                  ? `当前索引队列：处理中: ${queue.processing ?? "无"}，等待: ${queue.pending.length} 个\n\n`
-                  : "") +
-                "新文件会在添加到监听目录后自动索引。",
-            },
-          ],
+          content: makeTextContent(
+            "媒体库为空。\n\n" +
+              (queue
+                ? `当前索引队列：处理中: ${queue.processing ?? "无"}，等待: ${queue.pending.length} 个\n\n`
+                : "") +
+              "新文件会在添加到监听目录后自动索引。",
+          ),
           details: { total: 0, imageCount: 0, audioCount: 0 },
         };
       }
 
       return {
-        content: [
-          {
-            type: "text",
-            text:
-              `📊 媒体库统计:\n\n总计: ${total} 个文件\n图片: ${imageCount} 个\n音频: ${audioCount} 个\n` +
-              (queue
-                ? `\n索引队列:\n- 处理中: ${queue.processing ?? "无"}\n- 等待: ${queue.pending.length} 个`
-                : "") +
-              "\n\n💡 使用 media_search 搜索内容，或 media_list 浏览文件列表。",
-          },
-        ],
+        content: makeTextContent(
+          `📊 媒体库统计:\n\n总计: ${total} 个文件\n图片: ${imageCount} 个\n音频: ${audioCount} 个\n` +
+            (queue
+              ? `\n索引队列:\n- 处理中: ${queue.processing ?? "无"}\n- 等待: ${queue.pending.length} 个`
+              : "") +
+            "\n\n💡 使用 media_search 搜索内容，或 media_list 浏览文件列表。",
+        ),
         details: {
           total,
           imageCount,
@@ -549,8 +608,47 @@ export function createMediaListTool(
       } = params;
 
       // 解析时间参数
-      const afterTs = after ? new Date(after).getTime() : undefined;
-      const beforeTs = before ? new Date(before).getTime() : undefined;
+      const parsedAfter = parseIsoDate(after, "after");
+      if (parsedAfter.error) {
+        return {
+          content: makeTextContent(parsedAfter.error),
+          details: { total: 0, error: "invalid_after", files: [] },
+        };
+      }
+      const parsedBefore = parseIsoDate(before, "before");
+      if (parsedBefore.error) {
+        return {
+          content: makeTextContent(parsedBefore.error),
+          details: { total: 0, error: "invalid_before", files: [] },
+        };
+      }
+      if (
+        parsedAfter.value !== undefined &&
+        parsedBefore.value !== undefined &&
+        parsedAfter.value > parsedBefore.value
+      ) {
+        return {
+          content: makeTextContent("after 不能晚于 before。"),
+          details: { total: 0, error: "invalid_date_range", files: [] },
+        };
+      }
+      const parsedLimit = parsePositiveInt(limit, "limit", { min: 1, defaultValue: 20 });
+      if (parsedLimit.error) {
+        return {
+          content: makeTextContent(parsedLimit.error),
+          details: { total: 0, error: "invalid_limit", files: [] },
+        };
+      }
+      const parsedOffset = parsePositiveInt(offset, "offset", { min: 0, defaultValue: 0 });
+      if (parsedOffset.error) {
+        return {
+          content: makeTextContent(parsedOffset.error),
+          details: { total: 0, error: "invalid_offset", files: [] },
+        };
+      }
+
+      const afterTs = parsedAfter.value;
+      const beforeTs = parsedBefore.value;
 
       // 数据库查询（已索引）
       const { entries: indexedEntries } = await storage.list({
@@ -558,7 +656,7 @@ export function createMediaListTool(
         after: afterTs,
         before: beforeTs,
         // 先多取一些，后续可能与未索引文件合并再分页
-        limit: Math.max(limit + offset, 100),
+        limit: Math.max(parsedLimit.value + parsedOffset.value, 100),
         offset: 0,
       });
 
@@ -584,7 +682,7 @@ export function createMediaListTool(
         const expandedPaths = config.watchPaths.map(expandPath);
 
         // 扫描每个 watchPath，取一定数量的“最新文件”用于兜底
-        const perDirMax = Math.max(limit + offset, 20);
+        const perDirMax = Math.max(parsedLimit.value + parsedOffset.value, 20);
         for (const p of expandedPaths) {
           const scanned = await scanDirectoryForMediaFiles({
             dirPath: p,
@@ -632,19 +730,16 @@ export function createMediaListTool(
       ].sort((a, b) => b.fileCreatedAt - a.fileCreatedAt);
 
       const total = combined.length;
-      const paged = combined.slice(offset, offset + limit);
+      const paged = combined.slice(parsedOffset.value, parsedOffset.value + parsedLimit.value);
 
       if (paged.length === 0) {
         const totalCount = await storage.count();
         const cleanupHint =
           cleanedMissing > 0 ? `\n\n已自动清理 ${cleanedMissing} 条失效索引。` : "";
         return {
-          content: [
-            {
-              type: "text",
-              text: `没有找到符合条件的媒体文件。\n\n数据库中共有 ${totalCount} 个文件。建议调整过滤条件或使用 media_stats 查看总体情况。${cleanupHint}`,
-            },
-          ],
+          content: makeTextContent(
+            `没有找到符合条件的媒体文件。\n\n数据库中共有 ${totalCount} 个文件。建议调整过滤条件或使用 media_stats 查看总体情况。${cleanupHint}`,
+          ),
           details: { total: 0, totalInDatabase: totalCount, cleanedMissing, files: [] },
         };
       }
@@ -664,13 +759,14 @@ export function createMediaListTool(
           const previewLine = e.indexed
             ? `   📝 ${preview}${e.description.length > 60 ? "..." : ""}`
             : "   📝 （未索引，description 为空，可用 media_describe 触发分析）";
-          return `${offset + i + 1}. [${e.fileType}] ${e.fileName}${indexedFlag}\n   📅 ${date}\n${previewLine}`;
+          return `${parsedOffset.value + i + 1}. [${e.fileType}] ${e.fileName}${indexedFlag}\n   📅 ${date}\n   📁 ${e.filePath}\n${previewLine}`;
         })
         .join("\n\n");
 
       // 清理结果
       const sanitizedFiles = paged.map((e) => ({
         filePath: e.filePath,
+        path: e.filePath,
         fileName: e.fileName,
         type: e.fileType,
         indexed: e.indexed,
@@ -680,17 +776,14 @@ export function createMediaListTool(
       }));
 
       const pageInfo =
-        total > offset + limit
-          ? `\n\n（显示 ${offset + 1}-${offset + paged.length}，共 ${total} 个。使用 offset 参数查看更多）`
+        total > parsedOffset.value + parsedLimit.value
+          ? `\n\n（显示 ${parsedOffset.value + 1}-${parsedOffset.value + paged.length}，共 ${total} 个。使用 offset 参数查看更多）`
           : `\n\n（共 ${total} 个文件）`;
 
       return {
-        content: [
-          {
-            type: "text",
-            text: `📋 媒体文件列表：\n\n${text}${pageInfo}\n\n💡 indexed=false 的文件说明还没索引完；需要分析时可用 media_describe 触发索引并获取详细描述。`,
-          },
-        ],
+        content: makeTextContent(
+          `📋 媒体文件列表：\n\n${text}${pageInfo}\n\n💡 indexed=false 的文件说明还没索引完；需要分析时可用 media_describe 触发索引并获取详细描述。`,
+        ),
         details: {
           total,
           showing: paged.length,

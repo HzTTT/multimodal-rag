@@ -18,6 +18,7 @@ import {
   createMediaStatsTool,
 } from "./src/tools.js";
 import { runSetup, runNonInteractiveSetup } from "./src/setup.js";
+import { resolveWhisperBin } from "./src/whisper-bin.js";
 import type { PluginConfig } from "./src/types.js";
 
 function isMissingPathError(error: unknown): boolean {
@@ -50,6 +51,38 @@ async function splitCliExistingAndMissingCandidates(
   }
 
   return { existingIds, missingCandidates };
+}
+
+function parseCliDate(value: unknown, label: string): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new Error(`${label} 必须是 ISO 日期字符串`);
+  }
+  const ts = new Date(value).getTime();
+  if (!Number.isFinite(ts)) {
+    throw new Error(`${label} 不是合法日期，示例：2026-02-05T23:59:59`);
+  }
+  return ts;
+}
+
+function parseCliInteger(
+  value: unknown,
+  label: string,
+  options: { min: number; defaultValue?: number },
+): number {
+  if (value === undefined || value === null || value === "") {
+    if (options.defaultValue === undefined) {
+      throw new Error(`${label} 缺失`);
+    }
+    return options.defaultValue;
+  }
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < options.min) {
+    throw new Error(`${label} 必须是 >= ${options.min} 的整数`);
+  }
+  return n;
 }
 
 const multimodalRagPlugin = {
@@ -95,6 +128,31 @@ const multimodalRagPlugin = {
 
     // 解析数据库路径
     const resolvedDbPath = api.resolvePath(cfg.dbPath);
+    const whisperBin = resolveWhisperBin();
+
+    api.logger.info?.(
+      `multimodal-rag: runtime config ${JSON.stringify({
+        embeddingProvider: cfg.embedding.provider,
+        ollamaBaseUrl: cfg.ollama.baseUrl,
+        visionModel: cfg.ollama.visionModel,
+        embedModel: cfg.ollama.embedModel,
+        dbPath: resolvedDbPath,
+      })}`,
+    );
+    api.logger.info?.(
+      `multimodal-rag: dependency hints ${JSON.stringify({
+        whisperBin,
+        ffmpegRequired: true,
+        ollamaRequiredForImage: true,
+        ollamaRequiredForEmbedding: cfg.embedding.provider === "ollama",
+        openaiKeyConfigured:
+          cfg.embedding.provider !== "openai" || !!cfg.embedding.openaiApiKey,
+      })}`,
+    );
+
+    if (cfg.embedding.provider === "openai" && !cfg.embedding.openaiApiKey) {
+      throw new Error("embedding.provider=openai 时必须配置 embedding.openaiApiKey");
+    }
 
     // 创建嵌入提供者
     const embeddings = createEmbeddingProvider({
@@ -195,15 +253,31 @@ const multimodalRagPlugin = {
         .option("--limit <n>", "返回数量", "5")
         .action(async (query: string, opts: any) => {
           try {
-            const vector = await embeddings.embed(query);
-            const afterTs = opts.after ? new Date(opts.after).getTime() : undefined;
-            const beforeTs = opts.before ? new Date(opts.before).getTime() : undefined;
+            const normalizedQuery = typeof query === "string" ? query.trim() : "";
+            if (!normalizedQuery) {
+              throw new Error("query 不能为空");
+            }
+            const afterTs = parseCliDate(opts.after, "after");
+            const beforeTs = parseCliDate(opts.before, "before");
+            if (
+              afterTs !== undefined &&
+              beforeTs !== undefined &&
+              afterTs > beforeTs
+            ) {
+              throw new Error("after 不能晚于 before");
+            }
+            const limit = parseCliInteger(opts.limit, "limit", {
+              min: 1,
+              defaultValue: 5,
+            });
+
+            const vector = await embeddings.embed(normalizedQuery);
 
             const results = await storage.search(vector, {
               type: opts.type,
               after: afterTs,
               before: beforeTs,
-              limit: Number.parseInt(opts.limit),
+              limit,
               minScore: 0.3,
             });
 
@@ -284,15 +358,30 @@ const multimodalRagPlugin = {
         .option("--offset <n>", "偏移量", "0")
         .action(async (opts: any) => {
           try {
-            const afterTs = opts.after ? new Date(opts.after).getTime() : undefined;
-            const beforeTs = opts.before ? new Date(opts.before).getTime() : undefined;
+            const afterTs = parseCliDate(opts.after, "after");
+            const beforeTs = parseCliDate(opts.before, "before");
+            if (
+              afterTs !== undefined &&
+              beforeTs !== undefined &&
+              afterTs > beforeTs
+            ) {
+              throw new Error("after 不能晚于 before");
+            }
+            const limit = parseCliInteger(opts.limit, "limit", {
+              min: 1,
+              defaultValue: 20,
+            });
+            const offset = parseCliInteger(opts.offset, "offset", {
+              min: 0,
+              defaultValue: 0,
+            });
 
             const { total, entries } = await storage.list({
               type: opts.type,
               after: afterTs,
               before: beforeTs,
-              limit: Number.parseInt(opts.limit),
-              offset: Number.parseInt(opts.offset),
+              limit,
+              offset,
             });
 
             const { existingIds, missingCandidates } = await splitCliExistingAndMissingCandidates(
@@ -318,7 +407,6 @@ const multimodalRagPlugin = {
             }
 
             console.log(`已索引 ${total} 个媒体文件:\n`);
-            const offset = Number.parseInt(opts.offset);
             for (let i = 0; i < visibleEntries.length; i++) {
               const e = visibleEntries[i];
               const date = new Date(e.fileCreatedAt).toLocaleString("zh-CN");
@@ -356,11 +444,7 @@ const multimodalRagPlugin = {
 
           let limit: number | undefined;
           if (opts.limit !== undefined) {
-            limit = Number.parseInt(String(opts.limit), 10);
-            if (!Number.isFinite(limit) || limit <= 0) {
-              console.error("--limit 必须是大于 0 的整数");
-              process.exit(1);
-            }
+            limit = parseCliInteger(opts.limit, "limit", { min: 1 });
           }
 
           try {
@@ -497,8 +581,18 @@ const multimodalRagPlugin = {
               dbPath: opts.dbPath,
               noIndexOnStart: opts.noIndexOnStart,
               notifyEnabled: opts.notifyEnabled,
-              notifyQuietWindowMs: opts.notifyQuietWindow ? Number.parseInt(opts.notifyQuietWindow) : undefined,
-              notifyBatchTimeoutMs: opts.notifyBatchTimeout ? Number.parseInt(opts.notifyBatchTimeout) : undefined,
+              notifyQuietWindowMs:
+                opts.notifyQuietWindow === undefined
+                  ? undefined
+                  : parseCliInteger(opts.notifyQuietWindow, "notifyQuietWindow", {
+                      min: 1,
+                    }),
+              notifyBatchTimeoutMs:
+                opts.notifyBatchTimeout === undefined
+                  ? undefined
+                  : parseCliInteger(opts.notifyBatchTimeout, "notifyBatchTimeout", {
+                      min: 1,
+                    }),
             });
           } else {
             await runSetup();

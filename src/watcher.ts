@@ -2,7 +2,7 @@
  * 文件监听服务
  */
 
-import chokidar from "chokidar";
+import chokidar, { type FSWatcher } from "chokidar";
 import { stat, readdir, realpath, readFile, writeFile, mkdir } from "node:fs/promises";
 import { basename, extname, resolve, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
@@ -39,11 +39,12 @@ function expandPath(p: string): string {
  * 文件监听器
  */
 export class MediaWatcher {
-  private watcher: chokidar.FSWatcher | null = null;
+  private watcher: FSWatcher | null = null;
   private processQueue: Set<string> = new Set();
   private processing = false;
   private processingFilePath: string | null = null;
   private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  private retryTimers: Set<NodeJS.Timeout> = new Set();
   private failedFiles: Map<string, { attempts: number; lastError: string }> = new Map();
   private brokenFiles: Map<string, BrokenFileRecord> = new Map();
   private readonly brokenFilesStatePath: string;
@@ -160,7 +161,7 @@ export class MediaWatcher {
       });
     });
 
-    this.watcher.on("error", (error) => {
+    this.watcher.on("error", (error: unknown) => {
       this.logger.warn?.(`Watcher error: ${String(error)}`);
     });
   }
@@ -181,6 +182,14 @@ export class MediaWatcher {
       clearTimeout(timer);
     }
     this.debounceTimers.clear();
+    for (const timer of this.retryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.retryTimers.clear();
+    this.processQueue.clear();
+    this.failedFiles.clear();
+    this.processing = false;
+    this.processingFilePath = null;
   }
 
   /**
@@ -219,6 +228,51 @@ export class MediaWatcher {
     } else {
       this.logger.info?.(`Deleted file not found in index: ${filePath}`);
     }
+  }
+
+  private logEvent(
+    level: "info" | "warn",
+    event: string,
+    fields: Record<string, unknown>,
+  ): void {
+    const payload = { event, ...fields };
+    if (level === "warn") {
+      this.logger.warn?.(JSON.stringify(payload));
+      return;
+    }
+    this.logger.info?.(JSON.stringify(payload));
+  }
+
+  private classifyError(errorMsg: string): string {
+    const normalized = errorMsg.toLowerCase();
+    if (normalized.includes("enoent") || normalized.includes("enotdir")) {
+      return "missing_file";
+    }
+    if (this.isTransientIndexingError(errorMsg)) {
+      return "transient";
+    }
+    if (normalized.includes("whisper")) {
+      return "whisper";
+    }
+    if (normalized.includes("ollama")) {
+      return "ollama";
+    }
+    return "unknown";
+  }
+
+  private scheduleRetry(filePath: string, delayMs: number): void {
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(timer);
+      this.enqueueFile(filePath);
+    }, delayMs);
+    this.retryTimers.add(timer);
+  }
+
+  private requiresOllamaForFile(fileType: MediaType): boolean {
+    if (fileType === "image") {
+      return true;
+    }
+    return this.config.embedding.provider === "ollama";
   }
 
   /**
@@ -261,6 +315,7 @@ export class MediaWatcher {
   async indexFile(filePath: string): Promise<boolean> {
     const ext = extname(filePath).toLowerCase();
     const fileName = basename(filePath);
+    const startedAt = Date.now();
     let fileType: MediaType | null = null;
 
     try {
@@ -273,36 +328,45 @@ export class MediaWatcher {
         return false; // 不支持的类型
       }
 
+      this.logEvent("info", "index_file_start", {
+        filePath,
+        fileType,
+        provider: this.config.embedding.provider,
+      });
+
       if (await this.shouldSkipBrokenFile(filePath)) {
         this.callbacks?.onFileSkipped?.(filePath, fileType, "broken");
         this.logger.info?.(`Skipping unchanged broken file: ${fileName}`);
         return true;
       }
 
-      // 检查 Ollama 健康状态
-      const ollamaHealthy = await this.checkOllamaHealth();
-      if (!ollamaHealthy) {
-        // Ollama 不可用，记录失败并稍后重试
-        const failedInfo = this.failedFiles.get(filePath) || { attempts: 0, lastError: "" };
-        failedInfo.attempts++;
-        failedInfo.lastError = "Ollama service unavailable";
-        this.failedFiles.set(filePath, failedInfo);
+      // 仅在当前文件路径确实依赖 Ollama 时检查健康状态
+      if (this.requiresOllamaForFile(fileType)) {
+        const ollamaHealthy = await this.checkOllamaHealth();
+        if (!ollamaHealthy) {
+          const failedInfo = this.failedFiles.get(filePath) || { attempts: 0, lastError: "" };
+          failedInfo.attempts++;
+          failedInfo.lastError = "Ollama service unavailable";
+          this.failedFiles.set(filePath, failedInfo);
 
-        if (failedInfo.attempts < 3) {
-          this.logger.warn?.(
-            `Ollama unavailable, will retry ${fileName} (attempt ${failedInfo.attempts}/3)`,
-          );
-          // 60 秒后重试
-          setTimeout(() => {
-            this.enqueueFile(filePath);
-          }, 60000);
-        } else {
-          this.logger.warn?.(
-            `Failed to index ${fileName} after 3 attempts: Ollama unavailable`,
-          );
-          this.callbacks?.onFileFailed(filePath, "Ollama service unavailable");
+          if (failedInfo.attempts < 3) {
+            this.logEvent("warn", "index_file_retry_scheduled", {
+              filePath,
+              fileType,
+              stage: "dependency_check",
+              retryAttempt: failedInfo.attempts,
+              reason: "ollama_unavailable",
+              retryDelayMs: 60000,
+            });
+            this.scheduleRetry(filePath, 60000);
+          } else {
+            this.logger.warn?.(
+              `Failed to index ${fileName} after 3 attempts: Ollama unavailable`,
+            );
+            this.callbacks?.onFileFailed(filePath, "Ollama service unavailable");
+          }
+          return false;
         }
-        return false;
       }
 
       // 获取文件元数据
@@ -378,6 +442,12 @@ export class MediaWatcher {
       }
 
       this.logger.info?.(`Indexed ${fileType}: ${fileName}`);
+      this.logEvent("info", "index_file_success", {
+        filePath,
+        fileType,
+        stage: "stored",
+        durationMs: Date.now() - startedAt,
+      });
       
       // 索引成功，清除失败记录
       this.failedFiles.delete(filePath);
@@ -400,6 +470,7 @@ export class MediaWatcher {
       }
 
       this.logger.warn?.(`Failed to index ${filePath}: ${errorMsg}`);
+      const errorClass = this.classifyError(errorMsg);
 
       // 记录失败，稍后重试
       const failedInfo = this.failedFiles.get(filePath) || { attempts: 0, lastError: "" };
@@ -412,12 +483,15 @@ export class MediaWatcher {
         failedInfo.attempts < 3 &&
         this.isTransientIndexingError(errorMsg)
       ) {
-        this.logger.warn?.(
-          `Will retry ${fileName} in 60s (attempt ${failedInfo.attempts}/3)`,
-        );
-        setTimeout(() => {
-          this.enqueueFile(filePath);
-        }, 60000);
+        this.logEvent("warn", "index_file_retry_scheduled", {
+          filePath,
+          fileType,
+          stage: "indexing",
+          retryAttempt: failedInfo.attempts,
+          errorClass,
+          retryDelayMs: 60000,
+        });
+        this.scheduleRetry(filePath, 60000);
       } else {
         if (this.shouldMarkFileAsBroken(errorMsg)) {
           await this.markFileAsBroken(filePath, errorMsg);
@@ -425,6 +499,14 @@ export class MediaWatcher {
         // 达到最大重试次数或非临时错误，通知回调：文件索引失败
         this.callbacks?.onFileFailed(filePath, errorMsg);
       }
+      this.logEvent("warn", "index_file_failed", {
+        filePath,
+        fileType,
+        stage: "indexing",
+        durationMs: Date.now() - startedAt,
+        retryAttempt: failedInfo.attempts,
+        errorClass,
+      });
       return false;
     }
   }

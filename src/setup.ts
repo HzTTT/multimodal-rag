@@ -10,6 +10,7 @@ import { stdin as input, stdout as output } from "node:process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { resolveWhisperBin } from "./whisper-bin.js";
 
 // 配置文件路径
 const CONFIG_DIR = path.join(os.homedir(), ".openclaw");
@@ -102,6 +103,22 @@ function writePluginConfig(pluginConfig: PluginConfigPartial): void {
   saveOpenClawConfig(config);
 }
 
+function printDependencyHints(pluginConfig: PluginConfigPartial): void {
+  const provider = pluginConfig.embedding?.provider || "ollama";
+  const openaiConfigured = !!pluginConfig.embedding?.openaiApiKey;
+  console.log("依赖提示:");
+  console.log(`  Whisper 命令:  ${resolveWhisperBin()}`);
+  console.log("  ffmpeg:        必需（音频转录）");
+  console.log(
+    `  Ollama:        ${
+      provider === "ollama" ? "必需（图像描述 + 嵌入）" : "必需（图像描述）"
+    }`,
+  );
+  if (provider === "openai") {
+    console.log(`  OpenAI API Key: ${openaiConfigured ? "已配置" : "未配置（必需）"}`);
+  }
+}
+
 /**
  * 非交互式配置
  *
@@ -132,6 +149,10 @@ export async function runNonInteractiveSetup(opts: NonInteractiveSetupOpts): Pro
       provider: opts.embeddingProvider || existing.embedding?.provider || "ollama",
       ...(opts.openaiApiKey && { openaiApiKey: opts.openaiApiKey }),
       ...(opts.openaiModel && { openaiModel: opts.openaiModel }),
+      ...(existing.embedding?.openaiApiKey &&
+        !opts.openaiApiKey && { openaiApiKey: existing.embedding.openaiApiKey }),
+      ...(existing.embedding?.openaiModel &&
+        !opts.openaiModel && { openaiModel: existing.embedding.openaiModel }),
     },
     dbPath: opts.dbPath || existing.dbPath || "~/.openclaw/multimodal-rag.lance",
     indexExistingOnStart: opts.noIndexOnStart ? false : (existing.indexExistingOnStart !== false),
@@ -172,6 +193,7 @@ export async function runNonInteractiveSetup(opts: NonInteractiveSetupOpts): Pro
       console.log(`    通知目标:   ${pluginConfig.notifications!.targets!.length} 个`);
     }
   }
+  printDependencyHints(pluginConfig);
   console.log();
   console.log("提示: 重启 OpenClaw Gateway 以加载新配置");
 }
@@ -304,6 +326,8 @@ export async function runSetup(): Promise<void> {
       console.log(`    通知目标:   ${pluginConfig.notifications!.targets!.length} 个`);
     }
   }
+  console.log();
+  printDependencyHints(pluginConfig);
   console.log();
 
   // 前置条件检查

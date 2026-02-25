@@ -49,6 +49,16 @@ ollama pull qwen3-embedding:latest
 export OPENCLAW_WHISPER_BIN=/absolute/path/to/whisper
 ```
 
+### 运行前自检清单
+
+启动前建议逐项确认：
+
+1. `whisper --help` 和 `ffmpeg -version` 均可执行（音频链路必需）。
+2. `embedding.provider=ollama` 时，`ollama serve` 正常，且 `embedModel` 已 pull。
+3. 任意配置下，图片链路都依赖 Ollama（`visionModel` 必须可用）。
+4. `embedding.provider=openai` 时，`embedding.openaiApiKey` 已配置。
+5. `watchPaths` 指向真实目录，且 OpenClaw 进程有读权限。
+
 ## 安装
 
 ### 方式一：从 npm 安装（推荐）

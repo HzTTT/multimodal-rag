@@ -2,7 +2,7 @@
   "id": "multimodal-rag",
   "name": "Multimodal RAG",
   "description": "多模态 RAG 插件，使用本地 AI 模型对图像和音频进行语义索引与时间感知搜索；源文件删除时自动移除索引（不会删除原文件）",
-  "version": "0.1.0",
+  "version": "0.3.5",
   "kind": "rag",
   "configSchema": {
     "type": "object",
