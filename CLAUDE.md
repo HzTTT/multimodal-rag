@@ -511,7 +511,7 @@ this.logger.debug?.(`Processing queue size: ${this.processQueue.size}`);
 {
   "vectordb": "^0.11.0",
   "chokidar": "^4.0.3",
-  "apache-arrow": "^18.2.0"
+  "apache-arrow": "^18.1.0"
 }
 ```
 

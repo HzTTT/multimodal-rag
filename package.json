@@ -1,6 +1,6 @@
 {
   "name": "@hzttt/multimodal-rag",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "OpenClaw plugin for multimodal RAG - semantic indexing and time-aware search for images and audio using local AI models",
   "type": "module",
   "repository": {
@@ -37,6 +37,7 @@
   "dependencies": {
     "@lancedb/lancedb": "^0.14.0",
     "@sinclair/typebox": "^0.33.0",
+    "apache-arrow": "^18.1.0",
     "chokidar": "^4.0.0"
   },
   "peerDependencies": {
