@@ -462,7 +462,7 @@ export class MediaWatcher {
       vector: sourceEntry.vector,
       fileHash,
       fileSize: stats.size,
-      fileCreatedAt: stats.birthtimeMs || stats.mtimeMs,
+      fileCreatedAt: stats.mtimeMs,
       fileModifiedAt: stats.mtimeMs,
     });
 
@@ -569,7 +569,7 @@ export class MediaWatcher {
           vector: existingByPath.vector,
           fileHash,
           fileSize: stats.size,
-          fileCreatedAt: stats.birthtimeMs || stats.mtimeMs,
+          fileCreatedAt: stats.mtimeMs,
           fileModifiedAt: stats.mtimeMs,
         });
         this.logger.info?.(`Updated metadata without reprocessing: ${fileName}`);
@@ -619,7 +619,7 @@ export class MediaWatcher {
         vector,
         fileHash,
         fileSize: stats.size,
-        fileCreatedAt: stats.birthtimeMs || stats.mtimeMs,
+        fileCreatedAt: stats.mtimeMs,
         fileModifiedAt: stats.mtimeMs,
       };
       if (existingByPath) {

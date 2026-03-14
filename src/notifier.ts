@@ -33,10 +33,11 @@ type RootConfigCompat = MainSessionConfig;
  * IndexNotifier 负责聚合索引事件并触发 agent 通知
  * 
  * 工作流程:
- * 1. 首个文件入队 -> 开始批次聚合，并立即发送"开始索引"通知
+ * 1. 首个文件入队 -> 开始批次聚合（不立即通知）
  * 2. 持续聚合文件状态
- * 3. 当批次内最后一个 queued 文件完成（无 queued）-> 立即发送"索引完成总结"通知
- * 4. 若出现异常卡住，依赖 batchTimeout 兜底完成批次
+ * 3. 当出现首个“有效结果”（indexed/failed）且批次仍有 queued 文件 -> 发送"开始索引"通知
+ * 4. 当批次内最后一个 queued 文件完成（无 queued）-> 发送"索引完成总结"通知
+ * 5. 若出现异常卡住，依赖 batchTimeout 兜底完成批次
  */
 export class IndexNotifier implements IndexEventCallbacks {
   private state: "idle" | "batching" = "idle";
@@ -44,6 +45,7 @@ export class IndexNotifier implements IndexEventCallbacks {
   private batchStartTime = 0;
   private startNotificationSent = false;
   private batchTimeoutTimer: NodeJS.Timeout | null = null;
+  private deliveryChain: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly config: NotificationConfig,
@@ -77,8 +79,6 @@ export class IndexNotifier implements IndexEventCallbacks {
         this.finalizeBatch();
       }, this.config.batchTimeoutMs);
     }
-
-    this.maybeSendStartNotification();
   }
 
   /**
@@ -89,13 +89,16 @@ export class IndexNotifier implements IndexEventCallbacks {
       return;
     }
     this.batch.set(filePath, { status: "indexed", fileType });
+    if (this.hasQueuedFiles()) {
+      this.maybeSendStartNotification();
+    }
     this.maybeFinalizeBatchIfSettled();
   }
 
   /**
    * 文件跳过事件（例如已存在的重复内容）
    */
-  onFileSkipped(filePath: string, fileType: MediaType): void {
+  onFileSkipped(filePath: string, fileType: MediaType, _reason?: string): void {
     if (this.state === "idle" && !this.batch.has(filePath)) {
       return;
     }
@@ -111,6 +114,9 @@ export class IndexNotifier implements IndexEventCallbacks {
       return;
     }
     this.batch.set(filePath, { status: "failed", error });
+    if (this.hasQueuedFiles()) {
+      this.maybeSendStartNotification();
+    }
     this.maybeFinalizeBatchIfSettled();
   }
 
@@ -148,10 +154,13 @@ export class IndexNotifier implements IndexEventCallbacks {
     if (this.state !== "batching") {
       return;
     }
-    const hasQueued = [...this.batch.values()].some((f) => f.status === "queued");
-    if (!hasQueued) {
+    if (!this.hasQueuedFiles()) {
       this.finalizeBatch();
     }
+  }
+
+  private hasQueuedFiles(): boolean {
+    return [...this.batch.values()].some((f) => f.status === "queued");
   }
 
   private hasMeaningfulResults(): boolean {
@@ -177,7 +186,12 @@ export class IndexNotifier implements IndexEventCallbacks {
    * 触发通知：仅保留 agent 主动回复链路。
    */
   private triggerAgent(text: string): void {
-    void this.triggerAgentInternal(text);
+    // 保证通知顺序可预测，避免“开始/完成”乱序投递。
+    this.deliveryChain = this.deliveryChain
+      .then(() => this.triggerAgentInternal(text))
+      .catch((err) => {
+        this.logger.warn?.(`Failed to enqueue notification trigger: ${String(err)}`);
+      });
   }
 
   private async triggerAgentInternal(text: string): Promise<void> {

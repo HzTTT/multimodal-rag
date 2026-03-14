@@ -177,8 +177,8 @@ async function scanDirectoryForMediaFiles(options: {
         filePath: fullPath,
         fileName: basename(fullPath),
         fileType,
-        // 某些文件系统 birthtime 不可靠，这里保留两者，后续排序用 mtime
-        fileCreatedAt: s.birthtimeMs || s.mtimeMs,
+        // 与已索引条目口径一致：统一使用 mtime 作为时间基准
+        fileCreatedAt: s.mtimeMs,
         fileModifiedAt: s.mtimeMs,
       });
     }
@@ -365,9 +365,8 @@ export function createMediaSearchTool(
             },
           );
           const scorePercent = (r.score * 100).toFixed(0);
-          // 提供更多描述上下文
-          const description = r.entry.description.slice(0, 150);
-          return `${i + 1}. [${r.entry.fileType}] ${r.entry.fileName} (匹配度: ${scorePercent}%)\n   📁 路径: ${r.entry.filePath}\n   📅 时间: ${date}\n   📝 描述: ${description}${r.entry.description.length > 150 ? "..." : ""}`;
+          const description = r.entry.description;
+          return `${i + 1}. [${r.entry.fileType}] ${r.entry.fileName} (匹配度: ${scorePercent}%)\n   📁 路径: ${r.entry.filePath}\n   📅 时间: ${date}\n   📝 描述: ${description}`;
         })
         .join("\n\n");
 
@@ -695,7 +694,7 @@ export function createMediaListTool(
             if (indexedPaths.has(f.filePath)) {
               continue;
             }
-            // 时间过滤：用 mtime/birthtime 的近似值，确保 after/before 能生效
+            // 时间过滤：与索引条目保持一致，统一以 mtime 为准
             if (afterTs && f.fileCreatedAt < afterTs) {
               continue;
             }
@@ -744,7 +743,7 @@ export function createMediaListTool(
         };
       }
 
-      // 格式化结果（包含描述摘要）
+      // 格式化结果（包含完整描述）
       const text = paged
         .map((e, i) => {
           const date = new Date(e.fileCreatedAt).toLocaleString("zh-CN", {
@@ -754,10 +753,9 @@ export function createMediaListTool(
             hour: "2-digit",
             minute: "2-digit",
           });
-          const preview = e.description ? e.description.slice(0, 60) : "";
           const indexedFlag = e.indexed ? "" : " ⏳(未索引)";
           const previewLine = e.indexed
-            ? `   📝 ${preview}${e.description.length > 60 ? "..." : ""}`
+            ? `   📝 ${e.description}`
             : "   📝 （未索引，description 为空，可用 media_describe 触发分析）";
           return `${parsedOffset.value + i + 1}. [${e.fileType}] ${e.fileName}${indexedFlag}\n   📅 ${date}\n   📁 ${e.filePath}\n${previewLine}`;
         })
@@ -770,7 +768,7 @@ export function createMediaListTool(
         fileName: e.fileName,
         type: e.fileType,
         indexed: e.indexed,
-        description: e.description ? e.description.slice(0, 150) : "",
+        description: e.description || "",
         fileCreatedAt: new Date(e.fileCreatedAt).toISOString(),
         indexedAt: e.indexedAt ? new Date(e.indexedAt).toISOString() : "",
       }));

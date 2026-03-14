@@ -175,7 +175,7 @@ async function seedIndexedEntry(filePath, overrides = {}) {
     vector: overrides.vector ?? [0.1, 0.2, 0.3],
     fileHash: hash,
     fileSize: fileStats.size,
-    fileCreatedAt: fileStats.birthtimeMs || fileStats.mtimeMs,
+    fileCreatedAt: fileStats.mtimeMs,
     fileModifiedAt: fileStats.mtimeMs,
     indexedAt: Date.now(),
   };
