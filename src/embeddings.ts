@@ -13,6 +13,7 @@ export class OllamaEmbeddingProvider implements IEmbeddingProvider {
   constructor(
     private readonly baseUrl: string,
     private readonly model: string,
+    private readonly apiKey?: string,
   ) {
     // qwen3-embedding:latest 的维度是 4096
     // qwen3-embedding:0.6b 的维度需要测试确认
@@ -20,24 +21,28 @@ export class OllamaEmbeddingProvider implements IEmbeddingProvider {
   }
 
   async embed(text: string): Promise<number[]> {
-    // 重试逻辑：Ollama 在并发请求时可能返回 500
     const maxRetries = 3;
-    const retryDelay = 1000; // 1秒
+    const retryDelay = 1000;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const response = await fetch(`${this.baseUrl}/api/embeddings`, {
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (this.apiKey) {
+          headers["Authorization"] = `Bearer ${this.apiKey}`;
+          headers["api-key"] = this.apiKey;
+        }
+        // 使用新版 /api/embed（兼容 Ollama ≥0.4 和 user-center 负载均衡代理）
+        const response = await fetch(`${this.baseUrl}/api/embed`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify({
             model: this.model,
-            prompt: text,
+            input: text,
           }),
         });
 
         if (!response.ok) {
           const errorText = await response.text().catch(() => response.statusText);
-          // 如果是 500 错误且还有重试次数，等待后重试
           if (response.status >= 500 && attempt < maxRetries) {
             console.warn(`[multimodal-rag] Ollama embedding failed (attempt ${attempt}/${maxRetries}): ${response.status} ${response.statusText}`);
             await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
@@ -47,13 +52,17 @@ export class OllamaEmbeddingProvider implements IEmbeddingProvider {
         }
 
         const data = await response.json();
-        if (!data.embedding || !Array.isArray(data.embedding)) {
-          throw new Error(`Invalid embedding response: missing embedding array`);
+        // 新版 /api/embed 返回 { embeddings: number[][] }
+        if (data.embeddings && Array.isArray(data.embeddings) && data.embeddings.length > 0) {
+          return data.embeddings[0];
         }
-        return data.embedding;
+        // 兼容旧版 /api/embeddings 返回 { embedding: number[] }
+        if (data.embedding && Array.isArray(data.embedding)) {
+          return data.embedding;
+        }
+        throw new Error("Invalid embedding response: missing embeddings array");
       } catch (error) {
-        // 网络错误也重试
-        if (attempt < maxRetries && (error as any).code === 'ECONNRESET') {
+        if (attempt < maxRetries && (error as NodeJS.ErrnoException).code === "ECONNRESET") {
           console.warn(`[multimodal-rag] Ollama connection error (attempt ${attempt}/${maxRetries}): ${(error as Error).message}`);
           await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
           continue;
@@ -118,6 +127,7 @@ export function createEmbeddingProvider(config: {
   provider: "ollama" | "openai";
   ollamaBaseUrl?: string;
   ollamaModel?: string;
+  ollamaApiKey?: string;
   openaiApiKey?: string;
   openaiModel?: string;
 }): IEmbeddingProvider {
@@ -125,6 +135,7 @@ export function createEmbeddingProvider(config: {
     return new OllamaEmbeddingProvider(
       config.ollamaBaseUrl ?? "http://127.0.0.1:11434",
       config.ollamaModel ?? "qwen3-embedding:latest",
+      config.ollamaApiKey,
     );
   }
 

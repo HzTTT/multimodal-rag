@@ -8,7 +8,7 @@
 - 自动监听本地文件夹（`~/mic-recordings`, `~/usb_data`）
 - 使用本地 Ollama 模型进行多模态索引
   - 图像: `qwen3-vl:2b` 生成描述 + `qwen3-embedding` 生成向量
-  - 音频: `whisper` 转录 + `qwen3-embedding` 生成向量
+  - 音频: `whisper`（本地）或 `GLM-ASR-2512`（智谱云端）转录 + `qwen3-embedding` 生成向量
 - 支持时间过滤和语义搜索
 - Agent 可通过工具直接查询并返回媒体文件
 
@@ -28,7 +28,7 @@ extensions/multimodal-rag/
 │   ├── config.ts          # 配置 schema 和默认值
 │   ├── embeddings.ts      # Ollama 嵌入提供者（带重试逻辑）
 │   ├── storage.ts         # LanceDB 向量存储
-│   ├── processor.ts       # 多模态处理器（qwen3-vl + whisper）
+│   ├── processor.ts       # 多模态处理器（qwen3-vl + whisper/GLM-ASR）
 │   ├── watcher.ts         # chokidar 文件监听服务
 │   └── tools.ts           # Agent 工具定义
 └── test/
@@ -52,11 +52,18 @@ extensions/multimodal-rag/
   },
   ollama: {
     baseUrl: "http://127.0.0.1:11434",
+    apiKey: undefined,  // 远程 Ollama 或 API 网关时设置
     visionModel: "qwen3-vl:2b",
     embedModel: "qwen3-embedding:latest"
   },
   embedding: {
     provider: "ollama"
+  },
+  whisper: {
+    provider: "local",        // "local"（Whisper CLI）或 "zhipu"（GLM-ASR 云端）
+    zhipuApiKey: undefined,   // 智谱 API Key（zhipu 时必填）
+    zhipuModel: "glm-asr-2512",
+    language: "zh"            // 仅 local whisper 使用
   }
 }
 ```
@@ -66,6 +73,7 @@ extensions/multimodal-rag/
 **配置说明**:
 - 大部分参数已设置为推荐默认值
 - 用户只需通过 `openclaw multimodal-rag setup` 配置 `watchPaths`
+- `ollama.apiKey` 可选，配置后所有 Ollama API 请求（嵌入、视觉、健康检查）会附带 `Authorization: Bearer <apiKey>` header
 - 如需自定义其他参数，可手动编辑配置文件
 
 ### 2. **向量存储 (`src/storage.ts`)**
@@ -258,7 +266,8 @@ ollama ps
 
 **参考速度**:
 - 图像: ~3-5 秒/张（qwen3-vl 处理 + 嵌入）
-- 音频: ~12-15 秒/条（whisper 转录 + 嵌入）
+- 音频（本地 whisper）: ~12-15 秒/条（whisper 转录 + 嵌入）
+- 音频（智谱 GLM-ASR）: ~2-5 秒/条（云端转录 + 嵌入，取决于网络）
 
 ### 6. 错误处理测试
 
@@ -364,13 +373,24 @@ systemctl --user restart openclaw-gateway.service
 
 ### 5. **音频文件索引速度慢**
 
-**原因**: Whisper 转录耗时较长（12-15秒/文件）
+**原因**: 本地 Whisper 转录耗时较长（12-15秒/文件）
 
-**优化方向**:
+**解决方案**:
 - ✅ 已实现队列处理（单个文件失败不影响其他）
 - ✅ 已实现自动重试
+- ✅ 支持智谱 GLM-ASR 云端转录（`whisper.provider=zhipu`，2-5秒/文件）
 - 考虑: 使用更小的 whisper 模型（`tiny` 替代 `base`）
 - 考虑: 并行处理（需注意 GPU 内存）
+
+### 5b. **智谱 GLM-ASR 音频时长限制**
+
+**症状**: 超过 30 秒的音频转录失败
+
+**原因**: GLM-ASR API 限制单次请求 ≤ 30 秒、≤ 25MB
+
+**现状**: 当前未实现自动分片，超时长音频会报错并进入重试队列
+
+**规避**: 短音频（语音备忘录、指令等）直接使用云端；长音频可保持 `whisper.provider=local`
 
 ### 6. **chokidar 启动时不索引已存在的文件**
 
@@ -504,7 +524,7 @@ this.logger.debug?.(`Processing queue size: ${this.processQueue.size}`);
 **运行时**:
 - Node.js: 22+
 - Ollama: latest
-- Python: 3.8+ (用于 whisper)
+- Python: 3.8+ (仅 `whisper.provider=local` 时需要)
 
 **核心依赖**:
 ```json
@@ -570,5 +590,5 @@ tail -200 /tmp/openclaw/openclaw-$(date +%Y-%m-%d).log | grep -A5 "media_search"
 
 ---
 
-**最后更新**: 2026-02-05  
+**最后更新**: 2026-03-18  
 **维护者**: OpenClaw Contributors

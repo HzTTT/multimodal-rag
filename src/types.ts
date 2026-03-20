@@ -69,6 +69,7 @@ export type PluginConfig = {
   };
   ollama: {
     baseUrl: string;
+    apiKey?: string;
     visionModel: string;
     embedModel: string;
   };
@@ -76,6 +77,13 @@ export type PluginConfig = {
     provider: "ollama" | "openai";
     openaiApiKey?: string;
     openaiModel: string;
+  };
+  whisper: {
+    provider: "local" | "zhipu";
+    zhipuApiKey?: string;
+    zhipuApiBaseUrl?: string;
+    zhipuModel?: string;
+    language?: string;
   };
   dbPath: string;
   watchDebounceMs: number;

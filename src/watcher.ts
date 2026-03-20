@@ -113,9 +113,19 @@ export class MediaWatcher {
     const supportedExts = [...fileTypes.image, ...fileTypes.audio];
 
     this.watcher = chokidar.watch(expandedPaths, {
-      ignored: /(^|[\/\\])\../, // 忽略隐藏文件
+      // 忽略隐藏文件，但不忽略 watchPaths 本身及其父目录
+      // 原因：watchPaths 可能在 ~/.openclaw 这类隐藏目录下，正则 /\../ 会误匹配父路径
+      ignored: (filePath: string) => {
+        const base = filePath.split("/").pop() ?? "";
+        if (!base.startsWith(".")) return false;
+        // 如果这条路径是某个 watchPath 的前缀（父目录或本身），不忽略
+        for (const wp of expandedPaths) {
+          if (wp.startsWith(filePath)) return false;
+        }
+        return true;
+      },
       persistent: true,
-      ignoreInitial: !this.config.indexExistingOnStart, // 是否索引现有文件
+      ignoreInitial: !this.config.indexExistingOnStart,
       awaitWriteFinish: {
         stabilityThreshold: 2000,
         pollInterval: 100,
@@ -869,7 +879,6 @@ export class MediaWatcher {
    */
   private async checkOllamaHealth(): Promise<boolean> {
     const now = Date.now();
-    // 每 60 秒检查一次
     if (now - this.lastOllamaCheck < 60000 && this.ollamaHealthy) {
       return this.ollamaHealthy;
     }
@@ -878,15 +887,35 @@ export class MediaWatcher {
 
     try {
       const ollamaUrl = this.config.ollama?.baseUrl || "http://localhost:11434";
-      const response = await fetch(`${ollamaUrl}/api/tags`, {
-        signal: AbortSignal.timeout(5000),
-      });
-
-      this.ollamaHealthy = response.ok;
-
-      if (!this.ollamaHealthy) {
-        this.logger.warn?.(`Ollama health check failed: HTTP ${response.status}`);
+      const headers: Record<string, string> = {};
+      if (this.config.ollama?.apiKey) {
+        headers["Authorization"] = `Bearer ${this.config.ollama.apiKey}`;
+        headers["api-key"] = this.config.ollama.apiKey;
       }
+
+      // 先尝试 /api/tags（原生 Ollama），404 时回退到 /v1/models（user-center 代理）
+      const tagsRes = await fetch(`${ollamaUrl}/api/tags`, {
+        signal: AbortSignal.timeout(5000),
+        headers,
+      });
+      if (tagsRes.ok) {
+        this.ollamaHealthy = true;
+        return true;
+      }
+      if (tagsRes.status === 404) {
+        const modelsRes = await fetch(`${ollamaUrl}/v1/models`, {
+          signal: AbortSignal.timeout(5000),
+          headers,
+        });
+        this.ollamaHealthy = modelsRes.ok;
+        if (!this.ollamaHealthy) {
+          this.logger.warn?.(`Ollama health check failed: /v1/models HTTP ${modelsRes.status}`);
+        }
+        return this.ollamaHealthy;
+      }
+
+      this.ollamaHealthy = false;
+      this.logger.warn?.(`Ollama health check failed: HTTP ${tagsRes.status}`);
     } catch (error) {
       this.ollamaHealthy = false;
       this.logger.warn?.(`Ollama is not responding: ${String(error)}`);

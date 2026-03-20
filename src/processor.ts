@@ -28,13 +28,27 @@ export class AudioTranscriptionError extends Error {
   }
 }
 
+type WhisperConfig = {
+  provider: "local" | "zhipu";
+  zhipuApiKey?: string;
+  zhipuApiBaseUrl?: string;
+  zhipuModel?: string;
+  language?: string;
+};
+
+const ZHIPU_SUPPORTED_AUDIO_EXTS = new Set([".wav", ".mp3"]);
+const ZHIPU_DEFAULT_API_BASE = "https://open.bigmodel.cn/api/paas/v4";
+const ZHIPU_DEFAULT_MODEL = "glm-asr-2512";
+
 /**
- * Qwen3-VL 图像处理器
+ * 多模态处理器（图像: Ollama Qwen3-VL，音频: local whisper 或 GLM-ASR）
  */
 export class Qwen3VLProcessor implements IMediaProcessor {
   constructor(
     private readonly baseUrl: string,
     private readonly model: string,
+    private readonly apiKey?: string,
+    private readonly whisperConfig?: WhisperConfig,
   ) {}
 
   /**
@@ -58,10 +72,14 @@ export class Qwen3VLProcessor implements IMediaProcessor {
 
 用中文回答，描述要具体详细，便于后续搜索。`;
 
-      // 调用 Ollama API
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (this.apiKey) {
+        headers["Authorization"] = `Bearer ${this.apiKey}`;
+        headers["api-key"] = this.apiKey;
+      }
       const response = await fetch(`${this.baseUrl}/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
           model: this.model,
           messages: [
@@ -238,28 +256,154 @@ export class Qwen3VLProcessor implements IMediaProcessor {
     }
   }
 
-  /**
-   * 处理音频（使用 whisper CLI）
-   */
   async processAudio(audioPath: string): Promise<string> {
+    if (this.whisperConfig?.provider === "zhipu") {
+      return this.processAudioZhipu(audioPath);
+    }
+    return this.processAudioLocal(audioPath);
+  }
+
+  /**
+   * GLM-ASR-2512 云端转录
+   *
+   * 限制: 文件 ≤ 25MB, 时长 ≤ 30 秒, 仅 wav/mp3（其他格式自动用 ffmpeg 转换）
+   */
+  private async processAudioZhipu(audioPath: string): Promise<string> {
+    const apiKey = this.whisperConfig?.zhipuApiKey;
+    if (!apiKey) {
+      throw new AudioTranscriptionError(
+        "whisper.provider=zhipu 时必须配置 whisper.zhipuApiKey",
+      );
+    }
+
+    const prepared = await this.prepareAudioForZhipu(audioPath);
+
+    try {
+      const audioBuffer = await readFile(prepared.path);
+      const ext = extname(prepared.path).toLowerCase();
+      const mimeType = ext === ".mp3" ? "audio/mpeg" : "audio/wav";
+
+      const formData = new FormData();
+      formData.append(
+        "file",
+        new Blob([audioBuffer], { type: mimeType }),
+        prepared.fileName,
+      );
+      formData.append(
+        "model",
+        this.whisperConfig?.zhipuModel || ZHIPU_DEFAULT_MODEL,
+      );
+      formData.append("stream", "false");
+
+      const apiBase =
+        this.whisperConfig?.zhipuApiBaseUrl || ZHIPU_DEFAULT_API_BASE;
+      const response = await fetch(`${apiBase}/audio/transcriptions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const detail = (await response.text().catch(() => "")).trim();
+        const suffix = detail ? ` - ${detail.slice(0, 240)}` : "";
+        throw new AudioTranscriptionError(
+          `GLM-ASR 转录失败: HTTP ${response.status}${suffix}`,
+        );
+      }
+
+      const data = (await response.json()) as { text?: string };
+      const text = data.text?.trim();
+
+      if (!text) {
+        throw new AudioTranscriptionError("GLM-ASR 未返回有效转录文本");
+      }
+      if (AUDIO_FAILURE_PATTERN.test(text)) {
+        throw new AudioTranscriptionError("GLM-ASR 返回了失败标记文本");
+      }
+
+      return text;
+    } finally {
+      await prepared.cleanup();
+    }
+  }
+
+  /**
+   * 将非 wav/mp3 格式转换为 wav 以适配智谱 ASR API
+   */
+  private async prepareAudioForZhipu(
+    audioPath: string,
+  ): Promise<{ path: string; fileName: string; cleanup: () => Promise<void> }> {
+    const { basename } = await import("node:path");
+    const ext = extname(audioPath).toLowerCase();
+    if (ZHIPU_SUPPORTED_AUDIO_EXTS.has(ext)) {
+      return {
+        path: audioPath,
+        fileName: basename(audioPath),
+        cleanup: async () => {},
+      };
+    }
+
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
     const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
     const execFileAsync = promisify(execFile);
-    const { mkdtemp, rm, readFile } = await import("node:fs/promises");
-    const { tmpdir } = await import("node:os");
-    const { join, basename } = await import("node:path");
 
-    // 创建临时目录存放转录结果
+    const tempDir = await mkdtemp(join(tmpdir(), "zhipu-asr-"));
+    const wavName = basename(audioPath).replace(/\.[^.]+$/, ".wav");
+    const convertedPath = join(tempDir, wavName);
+
+    try {
+      await execFileAsync(
+        "ffmpeg",
+        ["-y", "-v", "error", "-i", audioPath, "-ar", "16000", "-ac", "1", convertedPath],
+        { maxBuffer: 50 * 1024 * 1024 },
+      );
+      return {
+        path: convertedPath,
+        fileName: wavName,
+        cleanup: async () => {
+          await rm(tempDir, { recursive: true, force: true });
+        },
+      };
+    } catch (error) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      const err = error as NodeJS.ErrnoException;
+      if (err?.code === "ENOENT") {
+        throw new AudioTranscriptionError(
+          "音频格式转换失败: ffmpeg not found in PATH",
+          error,
+        );
+      }
+      throw new AudioTranscriptionError(
+        `音频格式转换失败: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * 本地 whisper CLI 转录
+   */
+  private async processAudioLocal(audioPath: string): Promise<string> {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    const { mkdtemp, rm, readFile: readFileLocal } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { basename } = await import("node:path");
+
     const tempDir = await mkdtemp(join(tmpdir(), "whisper-"));
 
     try {
       const whisperBin = resolveWhisperBin();
+      const language = this.whisperConfig?.language || "zh";
       const args = [
         audioPath,
         "--model",
         "base",
         "--language",
-        "zh",
+        language,
         "--output_format",
         "txt",
         "--output_dir",
@@ -270,15 +414,13 @@ export class Qwen3VLProcessor implements IMediaProcessor {
         maxBuffer: 10 * 1024 * 1024,
       });
 
-      // 读取转录结果（whisper 会创建 .txt 文件）
       const baseFileName = basename(audioPath).replace(/\.[^.]+$/, "");
       const txtPath = join(tempDir, `${baseFileName}.txt`);
 
       let transcription: string;
       try {
-        transcription = await readFile(txtPath, "utf-8");
+        transcription = await readFileLocal(txtPath, "utf-8");
       } catch {
-        // 如果读取失败，尝试从 stdout 获取
         transcription = `${stdout || ""}\n${stderr || ""}`.trim();
       }
 
@@ -299,12 +441,12 @@ export class Qwen3VLProcessor implements IMediaProcessor {
           error,
         );
       }
+      if (error instanceof AudioTranscriptionError) throw error;
       throw new AudioTranscriptionError(
         `Whisper 转录失败: ${error instanceof Error ? error.message : String(error)}`,
         error,
       );
     } finally {
-      // 清理临时目录
       try {
         await rm(tempDir, { recursive: true, force: true });
       } catch {}
@@ -317,7 +459,14 @@ export class Qwen3VLProcessor implements IMediaProcessor {
  */
 export function createMediaProcessor(config: {
   ollamaBaseUrl: string;
+  ollamaApiKey?: string;
   visionModel: string;
+  whisper?: WhisperConfig;
 }): IMediaProcessor {
-  return new Qwen3VLProcessor(config.ollamaBaseUrl, config.visionModel);
+  return new Qwen3VLProcessor(
+    config.ollamaBaseUrl,
+    config.visionModel,
+    config.ollamaApiKey,
+    config.whisper,
+  );
 }

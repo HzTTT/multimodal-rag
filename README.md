@@ -5,7 +5,7 @@ OpenClaw 多模态 RAG 插件 — 使用本地 AI 模型对图像和音频进行
 ## 功能特性
 
 - **图像索引**：使用 Qwen3-VL 自动描述图像内容并生成嵌入向量
-- **音频索引**：使用 Whisper 转录音频并生成嵌入向量
+- **音频索引**：使用 Whisper（本地）或智谱 GLM-ASR（云端）转录音频并生成嵌入向量
 - **语义搜索**：基于向量相似度的语义检索，支持中英文
 - **时间过滤**：按文件创建时间范围过滤搜索结果
 - **自动监听**：实时监听文件夹变化，自动索引新增文件
@@ -20,10 +20,14 @@ OpenClaw 多模态 RAG 插件 — 使用本地 AI 模型对图像和音频进行
 
 - [Ollama](https://ollama.ai) 已安装并运行
 - 系统已安装 `ffmpeg`
-- 已安装 `whisper` 命令（`openai-whisper`）
+- **音频转录**（二选一）：
+  - **本地 Whisper**（默认）：已安装 `whisper` 命令（`openai-whisper`）
+  - **智谱 GLM-ASR**（云端）：拥有[智谱开放平台](https://open.bigmodel.cn/) API Key，无需安装 Whisper
 - 以下 Ollama 模型已拉取：
   - `qwen3-vl:2b` (视觉模型，图像描述)
   - `qwen3-embedding:latest` (嵌入模型，向量生成)
+
+**使用本地 Whisper 时：**
 
 ```bash
 # Ubuntu / Debian
@@ -49,15 +53,31 @@ ollama pull qwen3-embedding:latest
 export OPENCLAW_WHISPER_BIN=/absolute/path/to/whisper
 ```
 
+**使用智谱 GLM-ASR 云端转录时：**
+
+```bash
+# 只需 ffmpeg（用于格式转换）和 Ollama 模型
+sudo apt install -y ffmpeg
+ollama pull qwen3-vl:2b
+ollama pull qwen3-embedding:latest
+```
+
+无需安装 Whisper，但需在配置中设置 `whisper.provider: "zhipu"` 和 `whisper.zhipuApiKey`。
+
+> **注意**：GLM-ASR 限制单次请求音频时长 ≤ 30 秒、文件大小 ≤ 25MB，仅支持 wav/mp3 格式（其他格式会自动用 ffmpeg 转换）。
+
 ### 运行前自检清单
 
 启动前建议逐项确认：
 
-1. `whisper --help` 和 `ffmpeg -version` 均可执行（音频链路必需）。
-2. `embedding.provider=ollama` 时，`ollama serve` 正常，且 `embedModel` 已 pull。
-3. 任意配置下，图片链路都依赖 Ollama（`visionModel` 必须可用）。
-4. `embedding.provider=openai` 时，`embedding.openaiApiKey` 已配置。
-5. `watchPaths` 指向真实目录，且 OpenClaw 进程有读权限。
+1. `ffmpeg -version` 可执行（所有配置都需要）。
+2. `whisper.provider=local` 时，`whisper --help` 可执行。
+3. `whisper.provider=zhipu` 时，`whisper.zhipuApiKey` 已配置。
+4. `embedding.provider=ollama` 时，`ollama serve` 正常，且 `embedModel` 已 pull。
+5. 任意配置下，图片链路都依赖 Ollama（`visionModel` 必须可用）。
+6. `embedding.provider=openai` 时，`embedding.openaiApiKey` 已配置。
+7. 远程 Ollama 或经 API 网关访问时，`ollama.apiKey` 已配置。
+8. `watchPaths` 指向真实目录，且 OpenClaw 进程有读权限。
 
 ## 安装
 
@@ -117,6 +137,12 @@ openclaw multimodal-rag setup -n -w ~/photos -w ~/audio
 # 逗号分隔多个路径
 openclaw multimodal-rag setup -n --watch ~/photos,~/mic-recordings,~/usb_data
 
+# 连接远程 Ollama（带 API Key 认证）
+openclaw multimodal-rag setup -n \
+  --watch ~/photos \
+  --ollama-url http://192.168.0.100:11434 \
+  --ollama-api-key your-api-key-here
+
 # 自定义所有参数
 openclaw multimodal-rag setup -n \
   --watch ~/photos --watch ~/audio \
@@ -125,6 +151,12 @@ openclaw multimodal-rag setup -n \
   --embed-model qwen3-embedding:latest \
   --db-path ~/.openclaw/my-rag.lance \
   --no-index-on-start
+
+# 使用智谱 GLM-ASR 云端转录（替代本地 Whisper）
+openclaw multimodal-rag setup -n \
+  --watch ~/photos --watch ~/mic-recordings \
+  --whisper-provider zhipu \
+  --zhipu-api-key your-zhipu-api-key
 
 # 使用 OpenAI 嵌入
 openclaw multimodal-rag setup -n \
@@ -154,11 +186,16 @@ openclaw multimodal-rag setup -n \
 | `--non-interactive` | `-n` | 启用非交互式模式 | - |
 | `--watch <paths...>` | `-w` | 监听路径（可多次指定或逗号分隔） | 必填 |
 | `--ollama-url <url>` | - | Ollama 服务地址 | `http://127.0.0.1:11434` |
+| `--ollama-api-key <key>` | - | Ollama API Key（远程 Ollama 或 API 网关时需要） | - |
 | `--vision-model <model>` | - | 视觉模型 | `qwen3-vl:2b` |
 | `--embed-model <model>` | - | 嵌入模型 | `qwen3-embedding:latest` |
 | `--embedding-provider <p>` | - | 嵌入提供者: `ollama` / `openai` | `ollama` |
 | `--openai-api-key <key>` | - | OpenAI API Key | - |
 | `--openai-model <model>` | - | OpenAI 嵌入模型 | `text-embedding-3-small` |
+| `--whisper-provider <p>` | - | 音频转录: `local` / `zhipu` | `local` |
+| `--zhipu-api-key <key>` | - | 智谱 API Key（仅 zhipu 时需要） | - |
+| `--zhipu-api-base-url <url>` | - | 智谱 API 地址（可选） | `https://open.bigmodel.cn/api/paas/v4` |
+| `--zhipu-model <model>` | - | 智谱 ASR 模型 | `glm-asr-2512` |
 | `--db-path <path>` | - | LanceDB 数据库路径 | `~/.openclaw/multimodal-rag.lance` |
 | `--no-index-on-start` | - | 启动时不索引已有文件 | `false` |
 | `--notify-enabled` | - | 启用索引完成通知 | 未指定时沿用已有配置，否则 `false` |
@@ -187,11 +224,16 @@ openclaw multimodal-rag setup -n \
           "watchPaths": ["~/mic-recordings", "~/usb_data"],
           "ollama": {
             "baseUrl": "http://127.0.0.1:11434",
+            "apiKey": "",
             "visionModel": "qwen3-vl:2b",
             "embedModel": "qwen3-embedding:latest"
           },
           "embedding": {
             "provider": "ollama"
+          },
+          "whisper": {
+            "provider": "zhipu",
+            "zhipuApiKey": "your-zhipu-api-key"
           },
           "dbPath": "~/.openclaw/multimodal-rag.lance",
           "indexExistingOnStart": true,
@@ -216,11 +258,17 @@ openclaw multimodal-rag setup -n \
 | ---------------------------- | -------- | ---------------------------------- | -------------------------------------- |
 | `watchPaths`                 | string[] | `[]`                               | 监听的文件夹路径（支持 `~` 展开）                    |
 | `ollama.baseUrl`             | string   | `http://127.0.0.1:11434`           | Ollama 服务地址                            |
+| `ollama.apiKey`              | string   | -                                  | Ollama API Key（远程 Ollama 或 API 网关时需要）  |
 | `ollama.visionModel`         | string   | `qwen3-vl:2b`                      | 用于图像描述的视觉模型                            |
 | `ollama.embedModel`          | string   | `qwen3-embedding:latest`           | 用于生成嵌入向量的模型                            |
 | `embedding.provider`         | string   | `ollama`                           | 嵌入提供者: `ollama` 或 `openai`             |
 | `embedding.openaiApiKey`     | string   | -                                  | OpenAI API Key（仅 openai 时需要）           |
 | `embedding.openaiModel`      | string   | `text-embedding-3-small`           | OpenAI 嵌入模型                            |
+| `whisper.provider`           | string   | `local`                            | 音频转录提供者: `local`（Whisper CLI）或 `zhipu`（GLM-ASR 云端）|
+| `whisper.zhipuApiKey`        | string   | -                                  | 智谱 API Key（仅 zhipu 时需要）              |
+| `whisper.zhipuApiBaseUrl`    | string   | `https://open.bigmodel.cn/api/paas/v4` | 智谱 API 地址（可选，用于自定义端点）       |
+| `whisper.zhipuModel`         | string   | `glm-asr-2512`                     | 智谱 ASR 模型                              |
+| `whisper.language`           | string   | `zh`                               | 转录语言（仅 local whisper 使用）            |
 | `dbPath`                     | string   | `~/.openclaw/multimodal-rag.lance` | LanceDB 数据库路径                          |
 | `watchDebounceMs`            | number   | `1000`                             | 文件监听去抖延迟（毫秒）                           |
 | `indexExistingOnStart`       | boolean  | `true`                             | 启动时是否索引已有文件                            |
@@ -418,7 +466,7 @@ openclaw plugins list | grep multimodal-rag
 
 ### 音频索引失败或统计异常
 
-先检查依赖：
+**本地 Whisper 模式**，检查依赖：
 
 ```bash
 ffmpeg -version
@@ -426,15 +474,14 @@ whisper --help
 which whisper
 ```
 
-如果 `whisper` 找不到，执行：
+如果 `whisper` 找不到，执行 `pipx ensurepath` 然后重开终端。
 
-```bash
-pipx ensurepath
-```
+**智谱 GLM-ASR 模式**，检查：
+- API Key 是否配置正确
+- 音频文件是否超过 30 秒或 25MB（当前不支持自动分片）
+- 查看日志中的 HTTP 状态码：`tail -200 /tmp/openclaw/openclaw-$(date +%Y-%m-%d).log | grep GLM-ASR`
 
-然后重开终端后重试。
-
-再清理历史脏数据并重新索引：
+清理历史脏数据并重新索引：
 
 ```bash
 openclaw multimodal-rag cleanup-failed-audio --confirm

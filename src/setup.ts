@@ -20,6 +20,7 @@ type PluginConfigPartial = {
   watchPaths?: string[];
   ollama?: {
     baseUrl?: string;
+    apiKey?: string;
     visionModel?: string;
     embedModel?: string;
   };
@@ -27,6 +28,13 @@ type PluginConfigPartial = {
     provider?: "ollama" | "openai";
     openaiApiKey?: string;
     openaiModel?: string;
+  };
+  whisper?: {
+    provider?: "local" | "zhipu";
+    zhipuApiKey?: string;
+    zhipuApiBaseUrl?: string;
+    zhipuModel?: string;
+    language?: string;
   };
   dbPath?: string;
   indexExistingOnStart?: boolean;
@@ -49,11 +57,16 @@ type PluginConfigPartial = {
 export type NonInteractiveSetupOpts = {
   watch: string[];
   ollamaUrl?: string;
+  ollamaApiKey?: string;
   visionModel?: string;
   embedModel?: string;
   embeddingProvider?: "ollama" | "openai";
   openaiApiKey?: string;
   openaiModel?: string;
+  whisperProvider?: "local" | "zhipu";
+  zhipuApiKey?: string;
+  zhipuApiBaseUrl?: string;
+  zhipuModel?: string;
   dbPath?: string;
   noIndexOnStart?: boolean;
   notifyEnabled?: boolean;
@@ -104,17 +117,24 @@ function writePluginConfig(pluginConfig: PluginConfigPartial): void {
 }
 
 function printDependencyHints(pluginConfig: PluginConfigPartial): void {
-  const provider = pluginConfig.embedding?.provider || "ollama";
+  const embeddingProvider = pluginConfig.embedding?.provider || "ollama";
+  const whisperProvider = pluginConfig.whisper?.provider || "local";
   const openaiConfigured = !!pluginConfig.embedding?.openaiApiKey;
+  const zhipuKeyConfigured = !!pluginConfig.whisper?.zhipuApiKey;
   console.log("依赖提示:");
-  console.log(`  Whisper 命令:  ${resolveWhisperBin()}`);
-  console.log("  ffmpeg:        必需（音频转录）");
+  if (whisperProvider === "local") {
+    console.log(`  Whisper 命令:  ${resolveWhisperBin()}`);
+  } else {
+    console.log(`  音频转录:      智谱 GLM-ASR (${pluginConfig.whisper?.zhipuModel || "glm-asr-2512"})`);
+    console.log(`  智谱 API Key:  ${zhipuKeyConfigured ? "已配置" : "未配置（必需）"}`);
+  }
+  console.log("  ffmpeg:        必需（音频格式转换）");
   console.log(
     `  Ollama:        ${
-      provider === "ollama" ? "必需（图像描述 + 嵌入）" : "必需（图像描述）"
+      embeddingProvider === "ollama" ? "必需（图像描述 + 嵌入）" : "必需（图像描述）"
     }`,
   );
-  if (provider === "openai") {
+  if (embeddingProvider === "openai") {
     console.log(`  OpenAI API Key: ${openaiConfigured ? "已配置" : "未配置（必需）"}`);
   }
 }
@@ -138,10 +158,12 @@ export async function runNonInteractiveSetup(opts: NonInteractiveSetupOpts): Pro
 
   const existing = getExistingPluginConfig(loadOpenClawConfig());
 
+  const ollamaApiKey = opts.ollamaApiKey || existing.ollama?.apiKey;
   const pluginConfig: PluginConfigPartial = {
     watchPaths: opts.watch,
     ollama: {
       baseUrl: opts.ollamaUrl || existing.ollama?.baseUrl || "http://127.0.0.1:11434",
+      ...(ollamaApiKey && { apiKey: ollamaApiKey }),
       visionModel: opts.visionModel || existing.ollama?.visionModel || "qwen3-vl:2b",
       embedModel: opts.embedModel || existing.ollama?.embedModel || "qwen3-embedding:latest",
     },
@@ -153,6 +175,19 @@ export async function runNonInteractiveSetup(opts: NonInteractiveSetupOpts): Pro
         !opts.openaiApiKey && { openaiApiKey: existing.embedding.openaiApiKey }),
       ...(existing.embedding?.openaiModel &&
         !opts.openaiModel && { openaiModel: existing.embedding.openaiModel }),
+    },
+    whisper: {
+      provider: opts.whisperProvider || existing.whisper?.provider || "local",
+      ...(opts.zhipuApiKey && { zhipuApiKey: opts.zhipuApiKey }),
+      ...(opts.zhipuApiBaseUrl && { zhipuApiBaseUrl: opts.zhipuApiBaseUrl }),
+      ...(opts.zhipuModel && { zhipuModel: opts.zhipuModel }),
+      ...(existing.whisper?.zhipuApiKey &&
+        !opts.zhipuApiKey && { zhipuApiKey: existing.whisper.zhipuApiKey }),
+      ...(existing.whisper?.zhipuApiBaseUrl &&
+        !opts.zhipuApiBaseUrl && { zhipuApiBaseUrl: existing.whisper.zhipuApiBaseUrl }),
+      ...(existing.whisper?.zhipuModel &&
+        !opts.zhipuModel && { zhipuModel: existing.whisper.zhipuModel }),
+      ...(existing.whisper?.language && { language: existing.whisper.language }),
     },
     dbPath: opts.dbPath || existing.dbPath || "~/.openclaw/multimodal-rag.lance",
     indexExistingOnStart: opts.noIndexOnStart ? false : (existing.indexExistingOnStart !== false),
@@ -173,9 +208,14 @@ export async function runNonInteractiveSetup(opts: NonInteractiveSetupOpts): Pro
   console.log("配置摘要:");
   console.log(`  监听路径:     ${pluginConfig.watchPaths!.join(", ")}`);
   console.log(`  Ollama 地址:  ${pluginConfig.ollama!.baseUrl}`);
+  console.log(`  Ollama API Key: ${pluginConfig.ollama!.apiKey ? "已配置" : "未配置"}`);
   console.log(`  视觉模型:     ${pluginConfig.ollama!.visionModel}`);
   console.log(`  嵌入模型:     ${pluginConfig.ollama!.embedModel}`);
   console.log(`  嵌入提供者:   ${pluginConfig.embedding!.provider}`);
+  console.log(`  音频转录:     ${pluginConfig.whisper?.provider === "zhipu" ? `智谱 GLM-ASR (${pluginConfig.whisper?.zhipuModel || "glm-asr-2512"})` : "本地 Whisper CLI"}`);
+  if (pluginConfig.whisper?.provider === "zhipu") {
+    console.log(`  智谱 API Key: ${pluginConfig.whisper?.zhipuApiKey ? "已配置" : "未配置"}`);
+  }
   console.log(`  数据库路径:   ${pluginConfig.dbPath}`);
   console.log(`  启动时索引:   ${pluginConfig.indexExistingOnStart ? "是" : "否"}`);
   console.log(`  索引通知:     ${pluginConfig.notifications!.enabled ? "已启用" : "已禁用"}`);
@@ -198,18 +238,29 @@ export async function runNonInteractiveSetup(opts: NonInteractiveSetupOpts): Pro
   console.log("提示: 重启 OpenClaw Gateway 以加载新配置");
 }
 
-async function checkOllamaHealth(baseUrl: string): Promise<boolean> {
+function buildOllamaHeaders(apiKey?: string): Record<string, string> | undefined {
+  if (!apiKey) return undefined;
+  return { Authorization: `Bearer ${apiKey}` };
+}
+
+async function checkOllamaHealth(baseUrl: string, apiKey?: string): Promise<boolean> {
   try {
-    const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(`${baseUrl}/api/tags`, {
+      signal: AbortSignal.timeout(5000),
+      headers: buildOllamaHeaders(apiKey),
+    });
     return res.ok;
   } catch {
     return false;
   }
 }
 
-async function listOllamaModels(baseUrl: string): Promise<string[]> {
+async function listOllamaModels(baseUrl: string, apiKey?: string): Promise<string[]> {
   try {
-    const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(`${baseUrl}/api/tags`, {
+      signal: AbortSignal.timeout(5000),
+      headers: buildOllamaHeaders(apiKey),
+    });
     if (!res.ok) return [];
     const data = (await res.json()) as { models?: Array<{ name: string }> };
     return data.models?.map((m) => m.name) ?? [];
@@ -271,8 +322,9 @@ export async function runSetup(): Promise<void> {
   // 检查 Ollama 连接状态（仅用于提示）
   // ================================================================
   const ollamaUrl = pluginConfig.ollama!.baseUrl!;
+  const existingApiKey = existing.ollama?.apiKey;
   process.stdout.write("检查 Ollama 连接...");
-  const ollamaOk = await checkOllamaHealth(ollamaUrl);
+  const ollamaOk = await checkOllamaHealth(ollamaUrl, existingApiKey);
   if (ollamaOk) {
     console.log(" ✓ 已连接\n");
   } else {
@@ -284,7 +336,7 @@ export async function runSetup(): Promise<void> {
   // 列出可用模型（仅用于提示）
   let availableModels: string[] = [];
   if (ollamaOk) {
-    availableModels = await listOllamaModels(ollamaUrl);
+    availableModels = await listOllamaModels(ollamaUrl, existingApiKey);
     if (availableModels.length > 0) {
       console.log("  已安装的模型:");
       for (const model of availableModels) {
@@ -312,6 +364,7 @@ export async function runSetup(): Promise<void> {
   console.log(`  视觉模型:     ${pluginConfig.ollama!.visionModel}`);
   console.log(`  嵌入模型:     ${pluginConfig.ollama!.embedModel}`);
   console.log(`  嵌入提供者:   ${pluginConfig.embedding!.provider}`);
+  console.log(`  音频转录:     ${pluginConfig.whisper?.provider === "zhipu" ? `智谱 GLM-ASR (${pluginConfig.whisper?.zhipuModel || "glm-asr-2512"})` : "本地 Whisper CLI"}`);
   console.log(`  数据库路径:   ${pluginConfig.dbPath}`);
   console.log(`  启动时索引:   ${pluginConfig.indexExistingOnStart ? "是" : "否"}`);
   console.log(`  索引通知:     ${pluginConfig.notifications!.enabled ? "已启用" : "已禁用"}`);

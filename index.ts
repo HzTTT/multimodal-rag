@@ -105,6 +105,7 @@ const multimodalRagPlugin = {
       },
       ollama: {
         baseUrl: userConfig.ollama?.baseUrl || "http://127.0.0.1:11434",
+        apiKey: userConfig.ollama?.apiKey,
         visionModel: userConfig.ollama?.visionModel || "qwen3-vl:2b",
         embedModel: userConfig.ollama?.embedModel || "qwen3-embedding:latest",
       },
@@ -112,6 +113,13 @@ const multimodalRagPlugin = {
         provider: userConfig.embedding?.provider || "ollama",
         openaiApiKey: userConfig.embedding?.openaiApiKey,
         openaiModel: userConfig.embedding?.openaiModel || "text-embedding-3-small",
+      },
+      whisper: {
+        provider: userConfig.whisper?.provider || "local",
+        zhipuApiKey: userConfig.whisper?.zhipuApiKey,
+        zhipuApiBaseUrl: userConfig.whisper?.zhipuApiBaseUrl,
+        zhipuModel: userConfig.whisper?.zhipuModel || "glm-asr-2512",
+        language: userConfig.whisper?.language || "zh",
       },
       dbPath: userConfig.dbPath || "~/.openclaw/multimodal-rag.lance",
       watchDebounceMs: userConfig.watchDebounceMs || 1000,
@@ -129,12 +137,14 @@ const multimodalRagPlugin = {
 
     // 解析数据库路径
     const resolvedDbPath = api.resolvePath(cfg.dbPath);
-    const whisperBin = resolveWhisperBin();
+    const whisperBin = cfg.whisper.provider === "local" ? resolveWhisperBin() : undefined;
 
     api.logger.info?.(
       `multimodal-rag: runtime config ${JSON.stringify({
         embeddingProvider: cfg.embedding.provider,
+        whisperProvider: cfg.whisper.provider,
         ollamaBaseUrl: cfg.ollama.baseUrl,
+        ollamaApiKeyConfigured: !!cfg.ollama.apiKey,
         visionModel: cfg.ollama.visionModel,
         embedModel: cfg.ollama.embedModel,
         dbPath: resolvedDbPath,
@@ -142,7 +152,12 @@ const multimodalRagPlugin = {
     );
     api.logger.info?.(
       `multimodal-rag: dependency hints ${JSON.stringify({
-        whisperBin,
+        whisperProvider: cfg.whisper.provider,
+        ...(whisperBin && { whisperBin }),
+        ...(cfg.whisper.provider === "zhipu" && {
+          zhipuApiKeyConfigured: !!cfg.whisper.zhipuApiKey,
+          zhipuModel: cfg.whisper.zhipuModel,
+        }),
         ffmpegRequired: true,
         ollamaRequiredForImage: true,
         ollamaRequiredForEmbedding: cfg.embedding.provider === "ollama",
@@ -154,11 +169,15 @@ const multimodalRagPlugin = {
     if (cfg.embedding.provider === "openai" && !cfg.embedding.openaiApiKey) {
       throw new Error("embedding.provider=openai 时必须配置 embedding.openaiApiKey");
     }
+    if (cfg.whisper.provider === "zhipu" && !cfg.whisper.zhipuApiKey) {
+      throw new Error("whisper.provider=zhipu 时必须配置 whisper.zhipuApiKey");
+    }
 
     // 创建嵌入提供者
     const embeddings = createEmbeddingProvider({
       provider: cfg.embedding.provider,
       ollamaBaseUrl: cfg.ollama.baseUrl,
+      ollamaApiKey: cfg.ollama.apiKey,
       ollamaModel: cfg.ollama.embedModel,
       openaiApiKey: cfg.embedding.openaiApiKey,
       openaiModel: cfg.embedding.openaiModel,
@@ -175,7 +194,9 @@ const multimodalRagPlugin = {
     // 创建媒体处理器
     const processor = createMediaProcessor({
       ollamaBaseUrl: cfg.ollama.baseUrl,
+      ollamaApiKey: cfg.ollama.apiKey,
       visionModel: cfg.ollama.visionModel,
+      whisper: cfg.whisper,
     });
 
     // 创建通知器（如果启用）
@@ -543,11 +564,16 @@ const multimodalRagPlugin = {
         .option("-n, --non-interactive", "非交互式模式（需配合 --watch 使用）")
         .option("-w, --watch <paths...>", "监听路径（可多次指定或逗号分隔）")
         .option("--ollama-url <url>", "Ollama 服务地址", "http://127.0.0.1:11434")
+        .option("--ollama-api-key <key>", "Ollama API Key（远程 Ollama 或 API 网关时需要）")
         .option("--vision-model <model>", "视觉模型名称", "qwen3-vl:2b")
         .option("--embed-model <model>", "嵌入模型名称", "qwen3-embedding:latest")
         .option("--embedding-provider <provider>", "嵌入提供者: ollama 或 openai", "ollama")
         .option("--openai-api-key <key>", "OpenAI API Key（仅 openai 时需要）")
         .option("--openai-model <model>", "OpenAI 嵌入模型")
+        .option("--whisper-provider <provider>", "音频转录: local 或 zhipu", "local")
+        .option("--zhipu-api-key <key>", "智谱 API Key（仅 zhipu 时需要）")
+        .option("--zhipu-api-base-url <url>", "智谱 API 地址（可选）")
+        .option("--zhipu-model <model>", "智谱 ASR 模型", "glm-asr-2512")
         .option("--db-path <path>", "LanceDB 数据库路径")
         .option("--no-index-on-start", "启动时不索引已有文件")
         .option("--notify-enabled", "启用索引完成通知")
@@ -557,11 +583,16 @@ const multimodalRagPlugin = {
           nonInteractive?: boolean;
           watch?: string[];
           ollamaUrl?: string;
+          ollamaApiKey?: string;
           visionModel?: string;
           embedModel?: string;
           embeddingProvider?: string;
           openaiApiKey?: string;
           openaiModel?: string;
+          whisperProvider?: string;
+          zhipuApiKey?: string;
+          zhipuApiBaseUrl?: string;
+          zhipuModel?: string;
           dbPath?: string;
           noIndexOnStart?: boolean;
           notifyEnabled?: boolean;
@@ -574,11 +605,16 @@ const multimodalRagPlugin = {
             await runNonInteractiveSetup({
               watch: watchPaths,
               ollamaUrl: opts.ollamaUrl,
+              ollamaApiKey: opts.ollamaApiKey,
               visionModel: opts.visionModel,
               embedModel: opts.embedModel,
               embeddingProvider: opts.embeddingProvider as "ollama" | "openai" | undefined,
               openaiApiKey: opts.openaiApiKey,
               openaiModel: opts.openaiModel,
+              whisperProvider: opts.whisperProvider as "local" | "zhipu" | undefined,
+              zhipuApiKey: opts.zhipuApiKey,
+              zhipuApiBaseUrl: opts.zhipuApiBaseUrl,
+              zhipuModel: opts.zhipuModel,
               dbPath: opts.dbPath,
               noIndexOnStart: opts.noIndexOnStart,
               notifyEnabled: opts.notifyEnabled,
