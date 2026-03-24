@@ -40,7 +40,7 @@ export type NotificationConfig = {
   batchTimeoutMs: number; // 批次最大超时（毫秒），默认 600000
   channel?: string; // agent 回复投递渠道，默认 "last"
   to?: string; // agent 回复投递目标（可选）
-  targets?: Array<{
+  targets: Array<{
     channel: string; // 回复目标渠道（agent --reply-channel）
     to: string; // 回复目标（agent --reply-to）
     accountId?: string; // 可选账号（agent --reply-account）
@@ -82,13 +82,13 @@ export type PluginConfig = {
     provider: "local" | "zhipu";
     zhipuApiKey?: string;
     zhipuApiBaseUrl?: string;
-    zhipuModel?: string;
-    language?: string;
+    zhipuModel: string;
+    language: string;
   };
   dbPath: string;
   watchDebounceMs: number;
   indexExistingOnStart: boolean;
-  notifications?: NotificationConfig;
+  notifications: NotificationConfig;
 };
 
 /**

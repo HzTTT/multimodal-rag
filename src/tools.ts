@@ -459,7 +459,15 @@ export function createMediaDescribeTool(
 
       if (!entry || refresh) {
         // 需要重新索引
-        await watcher.indexPath(normalizedPath);
+        try {
+          await watcher.indexPath(normalizedPath);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: makeTextContent(`无法索引文件: ${message}`),
+            details: { error: "indexing_failed", message },
+          };
+        }
         entry = await storage.findByPath(normalizedPath);
 
         if (!entry) {

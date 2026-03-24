@@ -33,15 +33,14 @@
 - `media_describe`：查看单文件完整描述，必要时触发重索引
 
 2. CLI 命令（`openclaw multimodal-rag ...`）
+- `doctor`
 - `index <path>`
 - `search <query>`
 - `stats`
 - `list`
 - `cleanup-missing`
 - `cleanup-failed-audio`
-- `clear`
 - `reindex`
-- `setup`（交互式/非交互式）
 
 3. 后台服务
 - `multimodal-rag-watcher`：文件系统监听 + 自动索引
@@ -325,17 +324,19 @@ Ollama 分支通过模型字符串推断向量维度（`0.6b -> 2048`, 其他默
 
 ---
 
-## 4.8 配置引导 `src/setup.ts`
+## 4.8 原生插件配置与诊断
 
-提供两种模式：
+当前实现已经移除 `setup` 配置引导，统一改为 OpenClaw 原生插件配置：
 
-1. 交互式 `runSetup()`  
-只强制用户输入监听路径，其余采用默认值；会检查 Ollama 连通与模型存在性并给出提示。
+1. 安装并启用插件  
+2. 在 `plugins.entries.multimodal-rag.config` 下写入配置  
+3. 使用 `openclaw multimodal-rag doctor` 做依赖和缺失项检查
 
-2. 非交互式 `runNonInteractiveSetup()`  
-适合 SSH / 自动化部署；通过命令行参数一次性写入 `~/.openclaw/openclaw.json`。
+这带来的变化是：
 
-写入位置统一为：`plugins.entries.multimodal-rag.config`。
+- manifest 成为静态配置契约的唯一来源
+- 插件注册阶段不再因为可选 provider key 缺失而直接失败
+- 具体 provider 错误被推迟到搜索、索引、转录等实际执行路径
 
 ---
 

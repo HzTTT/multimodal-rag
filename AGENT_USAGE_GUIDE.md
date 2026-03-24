@@ -12,7 +12,7 @@
 
 ### 2. **新增 media_stats 工具**
 
-- **media_describe**Agent 可以先了解媒体库状态
+- Agent 可以先了解媒体库状态
 - 当搜索不到时提供上下文
 
 ### 3. **优化搜索阈值**
@@ -25,6 +25,12 @@
 - 更清晰的成功/失败提示
 - 提供置信度评估
 - 包含后续建议
+
+### 5. **运维诊断前移**
+
+- 插件配置改为 OpenClaw 原生 `plugins.entries.multimodal-rag.config`
+- 运维侧优先使用 `openclaw multimodal-rag doctor`
+- `media_describe` 在重新索引失败时会返回更精确的配置/依赖错误
 
 ## 📊 4 个 Agent 工具
 
@@ -149,6 +155,12 @@ media_describe({
   indexedAt: "2026-02-05T11:15:30Z"
 }
 ```
+
+**Agent 提示**:
+
+- 如果返回 `无法索引文件: ...`，通常不是用户语义问题，而是运维配置或依赖问题
+- 这类情况应该提示操作者运行 `openclaw multimodal-rag doctor`
+- 常见原因：`embedding.openaiApiKey` 缺失、`whisper.zhipuApiKey` 缺失、`whisper`/`ffmpeg` 不可用
 
 ## 🎯 典型对话场景
 
@@ -294,6 +306,10 @@ media_search({
 4. **查看 gateway 日志**:
   ```bash
    journalctl -u openclaw-gateway.service -f
+  ```
+5. **先跑 doctor**:
+  ```bash
+   openclaw multimodal-rag doctor
   ```
 
 ---

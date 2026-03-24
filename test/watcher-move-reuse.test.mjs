@@ -4,7 +4,7 @@ import { copyFile, mkdtemp, mkdir, readFile, rename, rm, stat, unlink, writeFile
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { MediaWatcher } from "../dist/watcher.js";
+import { MediaWatcher } from "../dist/src/watcher.js";
 
 class FakeStorage {
   constructor(entries = []) {

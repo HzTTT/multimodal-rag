@@ -91,16 +91,23 @@ export class MediaWatcher {
   /**
    * 启动监听
    */
-  async start(): Promise<void> {
+  async start(): Promise<boolean> {
     if (this.watcher) {
-      return;
+      return true;
     }
 
     const { watchPaths, fileTypes, watchDebounceMs } = this.config;
 
+    if (this.config.embedding.provider === "openai" && !this.config.embedding.openaiApiKey) {
+      this.logger.warn?.(
+        "Background indexing disabled: embedding.provider=openai 但未配置 embedding.openaiApiKey",
+      );
+      return false;
+    }
+
     if (watchPaths.length === 0) {
       this.logger.warn?.("No watch paths configured, file watching disabled");
-      return;
+      return false;
     }
 
     await this.loadBrokenFilesState();
@@ -199,6 +206,8 @@ export class MediaWatcher {
     this.watcher.on("error", (error: unknown) => {
       this.logger.warn?.(`Watcher error: ${String(error)}`);
     });
+
+    return true;
   }
 
   /**
@@ -714,7 +723,7 @@ export class MediaWatcher {
   async indexPath(path: string): Promise<void> {
     const ok = await this.indexFile(path);
     if (!ok) {
-      throw new Error(`索引失败: ${path}`);
+      throw new Error(this.failedFiles.get(path)?.lastError || `索引失败: ${path}`);
     }
   }
 

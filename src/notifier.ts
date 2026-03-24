@@ -2,7 +2,7 @@
  * 索引通知器 - 批次聚合 + Agent 触发
  */
 
-import type { PluginRuntime } from "openclaw/plugin-sdk";
+import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
 import type { MediaType, NotificationConfig, IndexEventCallbacks } from "./types.js";
 
 type BatchFileStatus = "queued" | "indexed" | "skipped" | "failed";

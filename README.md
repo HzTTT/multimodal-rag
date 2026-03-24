@@ -104,115 +104,19 @@ openclaw plugins install ./multimodal-rag
 
 ## 配置
 
-### 交互式配置（推荐）
-
-安装完成后，运行引导配置向导：
+插件不再提供 `setup` 命令。安装后请直接使用 OpenClaw 原生插件流程：
 
 ```bash
-openclaw multimodal-rag setup
+openclaw plugins install @hzttt/multimodal-rag@latest
+openclaw plugins enable multimodal-rag
+openclaw multimodal-rag doctor
 ```
 
-向导将引导你配置**文件监听路径**，其他参数已使用推荐的默认值：
+实际配置统一写在 gateway 配置中的 `plugins.entries.multimodal-rag.config`。
 
-- **Ollama 地址**: `http://127.0.0.1:11434`
-- **视觉模型**: `qwen3-vl:2b` (图像描述)
-- **嵌入模型**: `qwen3-embedding:latest` (向量生成)
-- **嵌入提供者**: `ollama` (本地)
-- **数据库路径**: `~/.openclaw/multimodal-rag.lance`
-- **启动时索引**: `true` (自动索引已有文件)
+### 原生插件配置
 
-你只需要指定要监听的文件夹路径即可。
-
-### 非交互式配置（适合脚本/远程部署）
-
-通过命令行参数一次性完成配置，无需交互输入，适用于 SSH 远程部署、CI/CD 脚本等场景：
-
-```bash
-# 最简用法：只指定监听路径（其他使用默认值）
-openclaw multimodal-rag setup --non-interactive --watch ~/photos --watch ~/audio
-
-# 简写形式
-openclaw multimodal-rag setup -n -w ~/photos -w ~/audio
-
-# 逗号分隔多个路径
-openclaw multimodal-rag setup -n --watch ~/photos,~/mic-recordings,~/usb_data
-
-# 连接远程 Ollama（带 API Key 认证）
-openclaw multimodal-rag setup -n \
-  --watch ~/photos \
-  --ollama-url http://192.168.0.100:11434 \
-  --ollama-api-key your-api-key-here
-
-# 自定义所有参数
-openclaw multimodal-rag setup -n \
-  --watch ~/photos --watch ~/audio \
-  --ollama-url http://192.168.0.100:11434 \
-  --vision-model qwen3-vl:2b \
-  --embed-model qwen3-embedding:latest \
-  --db-path ~/.openclaw/my-rag.lance \
-  --no-index-on-start
-
-# 使用智谱 GLM-ASR 云端转录（替代本地 Whisper）
-openclaw multimodal-rag setup -n \
-  --watch ~/photos --watch ~/mic-recordings \
-  --whisper-provider zhipu \
-  --zhipu-api-key your-zhipu-api-key
-
-# 使用 OpenAI 嵌入
-openclaw multimodal-rag setup -n \
-  --watch ~/photos \
-  --embedding-provider openai \
-  --openai-api-key sk-xxx \
-  --openai-model text-embedding-3-small
-
-# 启用索引通知
-openclaw multimodal-rag setup -n \
-  --watch ~/photos \
-  --notify-enabled \
-  --notify-quiet-window 30000 \
-  --notify-batch-timeout 600000
-
-# 仅启用通知（其他通知参数沿用已有配置；若无则使用默认值）
-openclaw multimodal-rag setup -n \
-  --watch ~/photos \
-  --notify-enabled
-
-# 关闭通知（当前 CLI 无 --notify-disabled，需手动改配置）
-# 在 ~/.openclaw/openclaw.json 中将 notifications.enabled 设为 false
-```
-
-| 选项 | 简写 | 说明 | 默认值 |
-| --- | --- | --- | --- |
-| `--non-interactive` | `-n` | 启用非交互式模式 | - |
-| `--watch <paths...>` | `-w` | 监听路径（可多次指定或逗号分隔） | 必填 |
-| `--ollama-url <url>` | - | Ollama 服务地址 | `http://127.0.0.1:11434` |
-| `--ollama-api-key <key>` | - | Ollama API Key（远程 Ollama 或 API 网关时需要） | - |
-| `--vision-model <model>` | - | 视觉模型 | `qwen3-vl:2b` |
-| `--embed-model <model>` | - | 嵌入模型 | `qwen3-embedding:latest` |
-| `--embedding-provider <p>` | - | 嵌入提供者: `ollama` / `openai` | `ollama` |
-| `--openai-api-key <key>` | - | OpenAI API Key | - |
-| `--openai-model <model>` | - | OpenAI 嵌入模型 | `text-embedding-3-small` |
-| `--whisper-provider <p>` | - | 音频转录: `local` / `zhipu` | `local` |
-| `--zhipu-api-key <key>` | - | 智谱 API Key（仅 zhipu 时需要） | - |
-| `--zhipu-api-base-url <url>` | - | 智谱 API 地址（可选） | `https://open.bigmodel.cn/api/paas/v4` |
-| `--zhipu-model <model>` | - | 智谱 ASR 模型 | `glm-asr-2512` |
-| `--db-path <path>` | - | LanceDB 数据库路径 | `~/.openclaw/multimodal-rag.lance` |
-| `--no-index-on-start` | - | 启动时不索引已有文件 | `false` |
-| `--notify-enabled` | - | 启用索引完成通知 | 未指定时沿用已有配置，否则 `false` |
-| `--notify-quiet-window <ms>` | - | 通知静默窗口（毫秒） | 未指定时沿用已有配置，否则 `30000` |
-| `--notify-batch-timeout <ms>` | - | 通知批次超时（毫秒） | 未指定时沿用已有配置，否则 `600000` |
-
-通知参数行为说明（与当前实现一致）：
-
-- 非交互式执行时，`--notify-enabled` 仅负责“显式开启”，未传不会主动关闭通知。
-- 当前没有 `--notify-disabled` 选项；要关闭通知请手动编辑 `~/.openclaw/openclaw.json`。
-- `--notify-quiet-window` 和 `--notify-batch-timeout` 未传时会优先沿用已有配置，没有已有值才回退默认值。
-- `notifications.agentId` / `notifications.channel` / `notifications.to` / `notifications.targets` 目前通过配置文件手动设置（setup 命令暂未提供对应参数）。
-- 未配置 `targets` 且未配置 `channel+to` 时，插件会自动从 session store 选取“最近活跃会话”的 `lastChannel + lastTo` 作为通知目标。
-
-### 手动配置
-
-如需自定义配置，编辑 `~/.openclaw/openclaw.json`：
+编辑 `~/.openclaw/openclaw.json`（或你的 gateway 配置文件）：
 
 ```json
 {
@@ -250,6 +154,51 @@ openclaw multimodal-rag setup -n \
   }
 }
 ```
+
+推荐配置流程：
+
+1. 先写最小配置，只填 `watchPaths`。
+2. 如果使用远程 Ollama，再补 `ollama.apiKey`。
+3. 如果使用 `embedding.provider=openai`，必须补 `embedding.openaiApiKey`。
+4. 如果使用 `whisper.provider=zhipu`，必须补 `whisper.zhipuApiKey`。
+5. 保存后执行 `openclaw multimodal-rag doctor` 检查缺失项。
+
+关于“不完整配置”的新行为：
+
+- 插件加载不再因为缺少可选 provider key 而直接失败。
+- `doctor` 会显示需要补齐的配置项。
+- 真正执行搜索、索引或转录时，才会返回精确错误。
+
+### 通知配置
+
+通知通过配置文件开启，不再通过 CLI 向导写入。示例：
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "multimodal-rag": {
+        "config": {
+          "notifications": {
+            "enabled": true,
+            "agentId": "main",
+            "quietWindowMs": 30000,
+            "batchTimeoutMs": 600000,
+            "targets": [
+              {
+                "channel": "feishu",
+                "to": "ou_xxx_or_chat_id"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+如果未配置 `notifications.targets`，插件会先尝试 `channel + to`；若仍未配置，则自动使用最近活跃会话目标。
 
 ### 配置项说明
 
@@ -310,22 +259,6 @@ openclaw multimodal-rag setup -n \
 ```
 
 #### 启用通知
-
-**方式一：通过 setup 命令配置**
-
-```bash
-# 启用通知（使用默认参数）
-openclaw multimodal-rag setup -n --watch ~/photos --notify-enabled
-
-# 自定义通知参数
-openclaw multimodal-rag setup -n \
-  --watch ~/photos \
-  --notify-enabled \
-  --notify-quiet-window 45000 \
-  --notify-batch-timeout 300000
-```
-
-**方式二：手动编辑配置文件**
 
 在 `~/.openclaw/openclaw.json` 中设置 `notifications.enabled: true`：
 
@@ -394,11 +327,8 @@ Agent：[调用 media_stats] → 总计 120 个文件，图片 80，音频 40
 ### CLI 命令
 
 ```bash
-# 交互式配置
-openclaw multimodal-rag setup
-
-# 非交互式配置
-openclaw multimodal-rag setup -n --watch ~/photos --watch ~/audio
+# 诊断当前配置和依赖状态
+openclaw multimodal-rag doctor
 
 # 手动索引文件或文件夹
 openclaw multimodal-rag index ~/Pictures/photo.jpg
@@ -422,9 +352,6 @@ openclaw multimodal-rag cleanup-failed-audio --confirm
 # 清理“索引存在但源文件已删除”的失效索引
 openclaw multimodal-rag cleanup-missing --dry-run
 openclaw multimodal-rag cleanup-missing --confirm
-
-# 清空索引
-openclaw multimodal-rag clear --confirm
 ```
 
 ### 索引一致性与清理策略
@@ -462,6 +389,7 @@ openclaw multimodal-rag reindex --confirm
 
 ```bash
 openclaw plugins list | grep multimodal-rag
+openclaw multimodal-rag doctor
 ```
 
 ### 音频索引失败或统计异常
