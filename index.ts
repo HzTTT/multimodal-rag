@@ -4,7 +4,6 @@
  * 多模态 RAG 插件，支持图像和音频的语义索引与时间感知搜索。
  */
 
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { registerMultimodalRagCli } from "./src/cli.js";
 import { multimodalRagConfigSchema } from "./src/config.js";
 import { logMultimodalRagDoctorReport } from "./src/doctor.js";
@@ -14,7 +13,76 @@ import {
   registerMultimodalRagTools,
 } from "./src/runtime.js";
 
-const multimodalRagPlugin = definePluginEntry({
+type PluginConfigSchema = {
+  safeParse?: (value: unknown) => {
+    success: boolean;
+    data?: unknown;
+    error?: {
+      issues?: Array<{
+        path: Array<string | number>;
+        message: string;
+      }>;
+    };
+  };
+  parse?: (value: unknown) => unknown;
+  validate?: (value: unknown) => unknown;
+  jsonSchema?: Record<string, unknown>;
+};
+
+type NativePluginEntry = {
+  id: string;
+  name: string;
+  description: string;
+  kind?: string;
+  configSchema: PluginConfigSchema;
+  register: (api: any) => void;
+};
+
+function emptyPluginConfigSchema(): PluginConfigSchema {
+  return {
+    safeParse(value) {
+      if (value === undefined || (value && typeof value === "object" && !Array.isArray(value))) {
+        return { success: true, data: value ?? {} };
+      }
+      return {
+        success: false,
+        error: {
+          issues: [{ path: [], message: "expected config object" }],
+        },
+      };
+    },
+    jsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+  };
+}
+
+function definePluginEntryCompat(options: {
+  id: string;
+  name: string;
+  description: string;
+  kind?: string;
+  configSchema?: PluginConfigSchema | (() => PluginConfigSchema);
+  register: (api: any) => void;
+}): NativePluginEntry {
+  const resolvedConfigSchema =
+    typeof options.configSchema === "function"
+      ? options.configSchema()
+      : options.configSchema ?? emptyPluginConfigSchema();
+
+  return {
+    id: options.id,
+    name: options.name,
+    description: options.description,
+    ...(options.kind ? { kind: options.kind } : {}),
+    configSchema: resolvedConfigSchema,
+    register: options.register,
+  };
+}
+
+const multimodalRagPlugin = definePluginEntryCompat({
   id: "multimodal-rag",
   name: "Multimodal RAG",
   description:
