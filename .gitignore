@@ -6,3 +6,5 @@ dist/
 *.js.map
 *.d.ts.map
 !src/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
