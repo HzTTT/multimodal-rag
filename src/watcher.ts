@@ -7,6 +7,7 @@ import { stat, readdir, realpath, readFile, writeFile, mkdir } from "node:fs/pro
 import { basename, extname, resolve, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
+import { resolveMediaCreatedAt } from "./media-timestamps.js";
 import type {
   MediaType,
   PluginConfig,
@@ -459,10 +460,12 @@ export class MediaWatcher {
     fileType: MediaType;
     fileHash: string;
     stats: FileStatSnapshot;
+    mediaCreatedAt: number;
     source: MovedSourceCandidate;
     startedAt: number;
   }): Promise<void> {
-    const { filePath, fileName, fileType, fileHash, stats, source, startedAt } = params;
+    const { filePath, fileName, fileType, fileHash, stats, mediaCreatedAt, source, startedAt } =
+      params;
     const sourceEntry = source.entry;
 
     if (sourceEntry.filePath !== filePath) {
@@ -481,7 +484,7 @@ export class MediaWatcher {
       vector: sourceEntry.vector,
       fileHash,
       fileSize: stats.size,
-      fileCreatedAt: stats.mtimeMs,
+      fileCreatedAt: mediaCreatedAt,
       fileModifiedAt: stats.mtimeMs,
     });
 
@@ -563,6 +566,7 @@ export class MediaWatcher {
       const stats = await stat(filePath);
       const fileBuffer = await readFile(filePath);
       const fileHash = createHash("sha256").update(fileBuffer).digest("hex");
+      const mediaCreatedAt = await resolveMediaCreatedAt(filePath, fileType, stats);
 
       // 检查同路径记录：路径级一致性（不再做全局 hash 去重）
       const existingByPath = await this.storage.findByPath(filePath);
@@ -588,7 +592,7 @@ export class MediaWatcher {
           vector: existingByPath.vector,
           fileHash,
           fileSize: stats.size,
-          fileCreatedAt: stats.mtimeMs,
+          fileCreatedAt: mediaCreatedAt,
           fileModifiedAt: stats.mtimeMs,
         });
         this.logger.info?.(`Updated metadata without reprocessing: ${fileName}`);
@@ -607,6 +611,7 @@ export class MediaWatcher {
             fileType,
             fileHash,
             stats,
+            mediaCreatedAt,
             source: movedSource,
             startedAt,
           });
@@ -638,7 +643,7 @@ export class MediaWatcher {
         vector,
         fileHash,
         fileSize: stats.size,
-        fileCreatedAt: stats.mtimeMs,
+        fileCreatedAt: mediaCreatedAt,
         fileModifiedAt: stats.mtimeMs,
       };
       if (existingByPath) {
@@ -721,9 +726,38 @@ export class MediaWatcher {
    * 手动触发索引（用于初始化或强制重新索引）
    */
   async indexPath(path: string): Promise<void> {
-    const ok = await this.indexFile(path);
+    const resolvedPath = expandPath(path);
+    const pathStats = await stat(resolvedPath);
+
+    if (pathStats.isDirectory()) {
+      const supportedExts = [...this.config.fileTypes.image, ...this.config.fileTypes.audio];
+      const files = await this.scanDirectory(resolvedPath, supportedExts);
+      const failures: string[] = [];
+
+      for (const filePath of files) {
+        try {
+          const ok = await this.indexFile(filePath);
+          if (!ok) {
+            const reason = this.failedFiles.get(filePath)?.lastError;
+            failures.push(reason ? `索引失败: ${filePath} (${reason})` : `索引失败: ${filePath}`);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          failures.push(`索引失败: ${filePath} (${message})`);
+        }
+      }
+
+      if (failures.length > 0) {
+        throw new Error(
+          `目录索引完成，但以下 ${failures.length} 个文件失败:\n- ${failures.join("\n- ")}`,
+        );
+      }
+      return;
+    }
+
+    const ok = await this.indexFile(resolvedPath);
     if (!ok) {
-      throw new Error(this.failedFiles.get(path)?.lastError || `索引失败: ${path}`);
+      throw new Error(this.failedFiles.get(resolvedPath)?.lastError || `索引失败: ${resolvedPath}`);
     }
   }
 
