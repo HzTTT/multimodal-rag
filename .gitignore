@@ -8,3 +8,5 @@ dist/
 !src/
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+# OMX runtime state
+/.omx/
