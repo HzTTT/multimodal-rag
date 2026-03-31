@@ -8,7 +8,24 @@ import { stat } from "node:fs/promises";
 import type { MediaEntry, MediaSearchResult, MediaType } from "./types.js";
 
 const TABLE_NAME = "media";
-const FAILED_AUDIO_DESCRIPTION_PATTERN = /^[（(]\s*转录失败[:：]/;
+const SCALAR_FILTER_INDICES = [
+  { column: "fileType", factory: () => lancedb.Index.bitmap() },
+  { column: "fileCreatedAt", factory: () => lancedb.Index.btree() },
+] as const;
+const DEFAULT_AUTO_OPTIMIZE_THRESHOLD = 20;
+const DEFAULT_AUTO_OPTIMIZE_IDLE_MS = 5 * 60 * 1000;
+const FAILED_MEDIA_DESCRIPTION_PATTERNS = [
+  /^[（(]\s*转录失败[:：]/,
+  /^Whisper 转录失败[:：]/,
+  /^GLM-ASR 转录失败[:：]/,
+  /^Qwen3-VL processing failed:/,
+  /^Empty description from Qwen3-VL$/,
+];
+
+type MediaStorageOptions = {
+  autoOptimizeThreshold?: number;
+  autoOptimizeIdleMs?: number;
+};
 
 /**
  * 搜索选项
@@ -42,10 +59,16 @@ export class MediaStorage {
   private db: lancedb.Connection | null = null;
   private table: lancedb.Table | null = null;
   private initPromise: Promise<void> | null = null;
+  private scalarIndicesReady = false;
+  private autoOptimizeTimer: NodeJS.Timeout | null = null;
+  private autoOptimizeRunning = false;
+  private autoOptimizeDirtyOperations = 0;
+  private autoOptimizePendingRun = false;
 
   constructor(
     private readonly dbPath: string,
     private readonly vectorDim: number,
+    private readonly options: MediaStorageOptions = {},
   ) {}
 
   private async ensureInitialized(): Promise<void> {
@@ -104,6 +127,112 @@ export class MediaStorage {
       // 删除 schema 占位行
       await this.table.delete('id = "__schema__"');
     }
+
+    await this.ensureScalarFilterIndices();
+  }
+
+  private async ensureScalarFilterIndices(): Promise<void> {
+    if (!this.table || this.scalarIndicesReady) {
+      return;
+    }
+
+    try {
+      const totalRows = await this.table.countRows();
+      if (totalRows === 0) {
+        return;
+      }
+
+      const existingIndices = await this.table.listIndices();
+      const indexedColumns = new Set(
+        existingIndices.flatMap((index) => index.columns.map((column) => String(column))),
+      );
+
+      for (const spec of SCALAR_FILTER_INDICES) {
+        if (indexedColumns.has(spec.column)) {
+          continue;
+        }
+
+        await this.table.createIndex(spec.column, {
+          config: spec.factory(),
+          replace: false,
+        });
+      }
+
+      this.scalarIndicesReady = true;
+    } catch (error) {
+      console.warn(`[multimodal-rag] ensureScalarFilterIndices failed: ${String(error)}`);
+    }
+  }
+
+  private getAutoOptimizeThreshold(): number {
+    const value = this.options.autoOptimizeThreshold;
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return Math.floor(value);
+    }
+    return DEFAULT_AUTO_OPTIMIZE_THRESHOLD;
+  }
+
+  private getAutoOptimizeIdleMs(): number {
+    const value = this.options.autoOptimizeIdleMs;
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return Math.floor(value);
+    }
+    return DEFAULT_AUTO_OPTIMIZE_IDLE_MS;
+  }
+
+  private markAutoOptimizeDirty(): void {
+    this.autoOptimizeDirtyOperations++;
+
+    if (this.autoOptimizeRunning) {
+      this.autoOptimizePendingRun = true;
+      return;
+    }
+
+    const delayMs =
+      this.autoOptimizeDirtyOperations >= this.getAutoOptimizeThreshold()
+        ? 0
+        : this.getAutoOptimizeIdleMs();
+    this.scheduleAutoOptimize(delayMs);
+  }
+
+  private scheduleAutoOptimize(delayMs: number): void {
+    if (this.autoOptimizeTimer) {
+      clearTimeout(this.autoOptimizeTimer);
+    }
+
+    this.autoOptimizeTimer = setTimeout(() => {
+      this.autoOptimizeTimer = null;
+      void this.runAutoOptimize();
+    }, delayMs);
+    this.autoOptimizeTimer.unref?.();
+  }
+
+  private async runAutoOptimize(): Promise<void> {
+    if (!this.table || this.autoOptimizeRunning || this.autoOptimizeDirtyOperations === 0) {
+      return;
+    }
+
+    const dirtyOperations = this.autoOptimizeDirtyOperations;
+    this.autoOptimizeDirtyOperations = 0;
+    this.autoOptimizePendingRun = false;
+    this.autoOptimizeRunning = true;
+
+    try {
+      await this.refreshToLatest();
+      const stats = await this.table.optimize();
+      await this.refreshToLatest();
+      console.info?.(
+        `[multimodal-rag] auto optimize completed after ${dirtyOperations} modification(s): ${JSON.stringify(stats)}`,
+      );
+    } catch (error) {
+      console.warn(`[multimodal-rag] auto optimize failed: ${String(error)}`);
+    } finally {
+      this.autoOptimizeRunning = false;
+
+      if (this.autoOptimizePendingRun || this.autoOptimizeDirtyOperations > 0) {
+        this.scheduleAutoOptimize(this.getAutoOptimizeIdleMs());
+      }
+    }
   }
 
   /**
@@ -119,6 +248,8 @@ export class MediaStorage {
     };
 
     await this.table!.add([fullEntry]);
+    await this.ensureScalarFilterIndices();
+    this.markAutoOptimizeDirty();
     return fullEntry;
   }
 
@@ -325,6 +456,7 @@ export class MediaStorage {
     }
 
     await this.table!.delete(`id = '${id}'`);
+    this.markAutoOptimizeDirty();
     return true;
   }
 
@@ -484,20 +616,25 @@ export class MediaStorage {
     return allRows.filter((r) => r.fileType === type).length;
   }
 
+  private isFailedMediaDescription(description: string): boolean {
+    return FAILED_MEDIA_DESCRIPTION_PATTERNS.some((pattern) => pattern.test(description));
+  }
+
   /**
-   * 清理历史版本写入的音频脏数据（转录失败文本）
+   * 清理历史版本写入的失败媒体脏数据（音频/图片）
    */
-  async cleanupFailedAudioEntries(): Promise<{ removed: number; candidates: number }> {
+  async cleanupFailedMediaEntries(): Promise<{ removed: number; candidates: number }> {
     await this.ensureInitialized();
     await this.refreshToLatest();
 
     const rows = await this.getAllRows();
     const candidates = rows.filter((row) => {
-      if (row.fileType !== "audio") {
+      const fileType = String(row.fileType ?? "");
+      if (fileType !== "audio" && fileType !== "image") {
         return false;
       }
       const description = String(row.description ?? "").trim();
-      return FAILED_AUDIO_DESCRIPTION_PATTERN.test(description);
+      return this.isFailedMediaDescription(description);
     });
 
     let removed = 0;
@@ -510,7 +647,15 @@ export class MediaStorage {
       removed++;
     }
 
+    if (removed > 0) {
+      this.markAutoOptimizeDirty();
+    }
+
     return { removed, candidates: candidates.length };
+  }
+
+  async cleanupFailedAudioEntries(): Promise<{ removed: number; candidates: number }> {
+    return this.cleanupFailedMediaEntries();
   }
 
   /**
@@ -604,5 +749,6 @@ export class MediaStorage {
   async clear(): Promise<void> {
     await this.ensureInitialized();
     await this.table!.delete("id IS NOT NULL");
+    this.markAutoOptimizeDirty();
   }
 }
