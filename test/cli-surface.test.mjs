@@ -12,6 +12,7 @@ test("approved operator commands remain registered", async () => {
   assert(commands.includes("index"));
   assert(commands.includes("reindex"));
   assert(commands.includes("cleanup-missing"));
+  assert(commands.includes("cleanup-failed-media"));
   assert(commands.includes("cleanup-failed-audio"));
   assert(!commands.includes("setup"));
   assert(!commands.includes("clear"));

@@ -330,27 +330,44 @@ export function registerMultimodalRagCli(
         }
       });
 
-    // openclaw multimodal-rag cleanup-failed-audio
-    rag
-      .command("cleanup-failed-audio")
-      .description("清理历史转录失败导致的脏音频索引")
-      .option("--confirm", "确认清理")
-      .action(async (opts: any) => {
-        if (!opts.confirm) {
-          console.error("请使用 --confirm 确认清理操作");
-          process.exit(1);
-        }
+    const registerCleanupFailedMediaCommand = (
+      commandName: string,
+      description: string,
+    ): void => {
+      rag
+        .command(commandName)
+        .description(description)
+        .option("--confirm", "确认清理")
+        .action(async (opts: any) => {
+          if (!opts.confirm) {
+            console.error("请使用 --confirm 确认清理操作");
+            process.exit(1);
+          }
 
-        try {
-          const result = await storage.cleanupFailedAudioEntries();
-          console.log(
-            `✓ 清理完成：删除 ${result.removed} 条脏音频记录（候选 ${result.candidates} 条）`,
-          );
-        } catch (error) {
-          console.error(`清理失败: ${String(error)}`);
-          process.exit(1);
-        }
-      });
+          try {
+            const result = await storage.cleanupFailedMediaEntries();
+            const clearedMarkers = await watcher.clearBrokenFileMarkers();
+            console.log(
+              `✓ 清理完成：删除 ${result.removed} 条失败媒体记录（候选 ${result.candidates} 条），清除 ${clearedMarkers.removed} 个 broken-file 标记`,
+            );
+          } catch (error) {
+            console.error(`清理失败: ${String(error)}`);
+            process.exit(1);
+          }
+        });
+    };
+
+    // openclaw multimodal-rag cleanup-failed-media
+    registerCleanupFailedMediaCommand(
+      "cleanup-failed-media",
+      "清理历史失败导致的脏媒体索引（音频/图片）",
+    );
+
+    // openclaw multimodal-rag cleanup-failed-audio
+    registerCleanupFailedMediaCommand(
+      "cleanup-failed-audio",
+      "兼容旧命令：清理历史失败导致的脏媒体索引（音频/图片）",
+    );
 
     // openclaw multimodal-rag reindex
     rag

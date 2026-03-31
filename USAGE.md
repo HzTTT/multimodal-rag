@@ -90,7 +90,7 @@ openclaw multimodal-rag stats
 # 维护
 openclaw multimodal-rag cleanup-missing --dry-run
 openclaw multimodal-rag cleanup-missing --confirm
-openclaw multimodal-rag cleanup-failed-audio --confirm
+openclaw multimodal-rag cleanup-failed-media --confirm
 openclaw multimodal-rag reindex --confirm
 ```
 
@@ -103,7 +103,7 @@ openclaw multimodal-rag reindex --confirm
 - `index`
 - `reindex`
 - `cleanup-missing`
-- `cleanup-failed-audio`
+- `cleanup-failed-media`（旧命令 `cleanup-failed-audio` 仍兼容）
 
 已经移除：
 

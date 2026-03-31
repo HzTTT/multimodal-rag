@@ -1011,6 +1011,41 @@ export class MediaWatcher {
     };
   }
 
+  async clearBrokenFileMarkers(filePaths?: string[]): Promise<{ removed: number }> {
+    if (this.brokenFiles.size === 0) {
+      await this.loadBrokenFilesState();
+    }
+
+    if (!Array.isArray(filePaths) || filePaths.length === 0) {
+      const removed = this.brokenFiles.size;
+      if (removed === 0) {
+        return { removed: 0 };
+      }
+      this.brokenFiles.clear();
+      await this.saveBrokenFilesState();
+      this.logger.info?.(`Cleared ${removed} broken file marker(s)`);
+      return { removed };
+    }
+
+    const normalizedTargets = new Set(
+      await Promise.all(filePaths.map(async (filePath) => await this.normalizeComparablePath(filePath))),
+    );
+
+    let removed = 0;
+    for (const target of normalizedTargets) {
+      if (this.brokenFiles.delete(target)) {
+        removed++;
+      }
+    }
+
+    if (removed > 0) {
+      await this.saveBrokenFilesState();
+      this.logger.info?.(`Cleared ${removed} broken file marker(s)`);
+    }
+
+    return { removed };
+  }
+
   private isTransientIndexingError(errorMsg: string): boolean {
     const normalized = errorMsg.toLowerCase();
     return (

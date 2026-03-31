@@ -346,8 +346,8 @@ openclaw multimodal-rag list --type image --limit 10
 # 完整重新索引
 openclaw multimodal-rag reindex --confirm
 
-# 清理历史“转录失败”脏音频索引
-openclaw multimodal-rag cleanup-failed-audio --confirm
+# 清理历史失败导致的脏媒体索引（音频/图片）
+openclaw multimodal-rag cleanup-failed-media --confirm
 
 # 清理“索引存在但源文件已删除”的失效索引
 openclaw multimodal-rag cleanup-missing --dry-run
@@ -412,7 +412,7 @@ which whisper
 清理历史脏数据并重新索引：
 
 ```bash
-openclaw multimodal-rag cleanup-failed-audio --confirm
+openclaw multimodal-rag cleanup-failed-media --confirm
 openclaw multimodal-rag cleanup-missing --confirm
 openclaw multimodal-rag reindex --confirm
 ```
