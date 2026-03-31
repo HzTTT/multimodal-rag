@@ -21,6 +21,25 @@ type HeicTileGrid = {
   tiles: HeicTile[];
 };
 
+type VisionChatResponse = {
+  code?: number | string;
+  msg?: string;
+  error?: string;
+  message?: {
+    content?: string;
+  } | string;
+  data?: {
+    message?: {
+      content?: string;
+    } | string;
+  };
+  choices?: Array<{
+    message?: {
+      content?: string;
+    };
+  }>;
+};
+
 export class AudioTranscriptionError extends Error {
   constructor(message: string, public readonly cause?: unknown) {
     super(message);
@@ -99,10 +118,39 @@ export class Qwen3VLProcessor implements IMediaProcessor {
         throw new Error(`Qwen3-VL processing failed: HTTP ${response.status}${suffix}`);
       }
 
-      const data = await response.json();
-      const description = data.message?.content || "";
+      const data = await response.json() as VisionChatResponse;
+      const businessCode = data?.code;
+      const businessMessage =
+        typeof data?.msg === "string"
+          ? data.msg.trim()
+          : typeof data?.error === "string"
+            ? data.error.trim()
+            : "";
+
+      if (
+        businessCode !== undefined &&
+        businessCode !== null &&
+        String(businessCode) !== "0"
+      ) {
+        const suffix = businessMessage ? `, msg=${businessMessage}` : "";
+        throw new Error(`Qwen3-VL processing failed: code=${businessCode}${suffix}`);
+      }
+
+      const description =
+        (typeof data?.message === "object" && typeof data.message?.content === "string"
+          ? data.message.content
+          : "") ||
+        (typeof data?.data?.message === "object" && typeof data.data.message?.content === "string"
+          ? data.data.message.content
+          : "") ||
+        (Array.isArray(data?.choices) && typeof data.choices[0]?.message?.content === "string"
+          ? data.choices[0].message.content
+          : "");
 
       if (!description) {
+        if (businessMessage) {
+          throw new Error(`Qwen3-VL processing failed: ${businessMessage}`);
+        }
         throw new Error("Empty description from Qwen3-VL");
       }
 
