@@ -64,7 +64,8 @@ ollama pull qwen3-embedding:latest
 
 无需安装 Whisper，但需在配置中设置 `whisper.provider: "zhipu"` 和 `whisper.zhipuApiKey`。
 
-> **注意**：GLM-ASR 限制单次请求音频时长 ≤ 30 秒、文件大小 ≤ 25MB，仅支持 wav/mp3 格式（其他格式会自动用 ffmpeg 转换）。
+> **注意**：GLM-ASR 限制单次请求音频时长 ≤ 30 秒、文件大小 ≤ 25MB，仅支持 wav/mp3 格式。
+> 插件会在 `whisper.provider=zhipu` 时自动把超过 30 秒的音频按 25 秒切片、逐段上传，并将转录结果按顺序拼接为一段纯文本；其他格式也会先自动用 ffmpeg 转换后再处理。
 
 ### 运行前自检清单
 

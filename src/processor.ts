@@ -58,6 +58,8 @@ type WhisperConfig = {
 const ZHIPU_SUPPORTED_AUDIO_EXTS = new Set([".wav", ".mp3"]);
 const ZHIPU_DEFAULT_API_BASE = "https://open.bigmodel.cn/api/paas/v4";
 const ZHIPU_DEFAULT_MODEL = "glm-asr-2512";
+const ZHIPU_MAX_AUDIO_SECONDS = 30;
+const ZHIPU_SEGMENT_SECONDS = 25;
 
 /**
  * 多模态处理器（图像: Ollama Qwen3-VL，音频: local whisper 或 GLM-ASR）
@@ -327,51 +329,235 @@ export class Qwen3VLProcessor implements IMediaProcessor {
     const prepared = await this.prepareAudioForZhipu(audioPath);
 
     try {
-      const audioBuffer = await readFile(prepared.path);
-      const ext = extname(prepared.path).toLowerCase();
-      const mimeType = ext === ".mp3" ? "audio/mpeg" : "audio/wav";
-
-      const formData = new FormData();
-      formData.append(
-        "file",
-        new Blob([audioBuffer], { type: mimeType }),
+      const segmented = await this.prepareAudioSegmentsForZhipu(
+        prepared.path,
         prepared.fileName,
       );
-      formData.append(
-        "model",
-        this.whisperConfig?.zhipuModel || ZHIPU_DEFAULT_MODEL,
-      );
-      formData.append("stream", "false");
 
-      const apiBase =
-        this.whisperConfig?.zhipuApiBaseUrl || ZHIPU_DEFAULT_API_BASE;
-      const response = await fetch(`${apiBase}/audio/transcriptions`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}` },
-        body: formData,
-      });
+      try {
+        const transcripts: string[] = [];
+        for (const [index, segment] of segmented.segments.entries()) {
+          try {
+            transcripts.push(
+              await this.transcribeAudioSegmentWithZhipu(segment.path, segment.fileName, apiKey),
+            );
+          } catch (error) {
+            if (
+              segmented.segments.length > 1 &&
+              error instanceof AudioTranscriptionError
+            ) {
+              throw new AudioTranscriptionError(
+                `GLM-ASR 第 ${index + 1} 段转录失败: ${error.message}`,
+                error,
+              );
+            }
+            throw error;
+          }
+        }
 
-      if (!response.ok) {
-        const detail = (await response.text().catch(() => "")).trim();
-        const suffix = detail ? ` - ${detail.slice(0, 240)}` : "";
-        throw new AudioTranscriptionError(
-          `GLM-ASR 转录失败: HTTP ${response.status}${suffix}`,
-        );
+        const merged = this.mergeAudioTranscripts(transcripts);
+        if (!merged) {
+          throw new AudioTranscriptionError("GLM-ASR 未返回有效转录文本");
+        }
+
+        return merged;
+      } finally {
+        await segmented.cleanup();
       }
-
-      const data = (await response.json()) as { text?: string };
-      const text = data.text?.trim();
-
-      if (!text) {
-        throw new AudioTranscriptionError("GLM-ASR 未返回有效转录文本");
-      }
-      if (AUDIO_FAILURE_PATTERN.test(text)) {
-        throw new AudioTranscriptionError("GLM-ASR 返回了失败标记文本");
-      }
-
-      return text;
     } finally {
       await prepared.cleanup();
+    }
+  }
+
+  private async transcribeAudioSegmentWithZhipu(
+    audioPath: string,
+    fileName: string,
+    apiKey: string,
+  ): Promise<string> {
+    const audioBuffer = await readFile(audioPath);
+    const ext = extname(audioPath).toLowerCase();
+    const mimeType = ext === ".mp3" ? "audio/mpeg" : "audio/wav";
+
+    const formData = new FormData();
+    formData.append(
+      "file",
+      new Blob([audioBuffer], { type: mimeType }),
+      fileName,
+    );
+    formData.append(
+      "model",
+      this.whisperConfig?.zhipuModel || ZHIPU_DEFAULT_MODEL,
+    );
+    formData.append("stream", "false");
+
+    const apiBase =
+      this.whisperConfig?.zhipuApiBaseUrl || ZHIPU_DEFAULT_API_BASE;
+    const response = await fetch(`${apiBase}/audio/transcriptions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => "")).trim();
+      const suffix = detail ? ` - ${detail.slice(0, 240)}` : "";
+      throw new AudioTranscriptionError(
+        `GLM-ASR 转录失败: HTTP ${response.status}${suffix}`,
+      );
+    }
+
+    const data = (await response.json()) as { text?: string };
+    const text = data.text?.trim();
+
+    if (!text) {
+      throw new AudioTranscriptionError("GLM-ASR 未返回有效转录文本");
+    }
+    if (AUDIO_FAILURE_PATTERN.test(text)) {
+      throw new AudioTranscriptionError("GLM-ASR 返回了失败标记文本");
+    }
+
+    return text;
+  }
+
+  private mergeAudioTranscripts(transcripts: string[]): string {
+    return transcripts
+      .map((text) => text.replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  private async prepareAudioSegmentsForZhipu(
+    audioPath: string,
+    fileName: string,
+  ): Promise<{
+    segments: Array<{ path: string; fileName: string }>;
+    cleanup: () => Promise<void>;
+  }> {
+    const durationSeconds = await this.probeAudioDurationSeconds(audioPath);
+    if (
+      durationSeconds !== null &&
+      durationSeconds <= ZHIPU_MAX_AUDIO_SECONDS
+    ) {
+      return {
+        segments: [{ path: audioPath, fileName }],
+        cleanup: async () => {},
+      };
+    }
+
+    return this.splitAudioForZhipu(audioPath, fileName);
+  }
+
+  private async probeAudioDurationSeconds(audioPath: string): Promise<number | null> {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+
+    try {
+      const { stdout } = await execFileAsync(
+        "ffprobe",
+        [
+          "-v",
+          "error",
+          "-show_entries",
+          "format=duration",
+          "-of",
+          "default=noprint_wrappers=1:nokey=1",
+          audioPath,
+        ],
+        { maxBuffer: 10 * 1024 * 1024 },
+      );
+      const durationSeconds = Number(stdout.trim());
+      return Number.isFinite(durationSeconds) ? durationSeconds : null;
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err?.code === "ENOENT") {
+        return null;
+      }
+      throw new AudioTranscriptionError(
+        `音频时长检测失败: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+      );
+    }
+  }
+
+  private async splitAudioForZhipu(
+    audioPath: string,
+    fileName: string,
+  ): Promise<{
+    segments: Array<{ path: string; fileName: string }>;
+    cleanup: () => Promise<void>;
+  }> {
+    const { execFile } = await import("node:child_process");
+    const { mkdtemp, readdir, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { basename } = await import("node:path");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+
+    const tempDir = await mkdtemp(join(tmpdir(), "zhipu-asr-segments-"));
+    const baseName = fileName.replace(/\.[^.]+$/, "");
+    const outputPattern = join(tempDir, `${baseName}-%03d.wav`);
+
+    try {
+      await execFileAsync(
+        "ffmpeg",
+        [
+          "-y",
+          "-v",
+          "error",
+          "-i",
+          audioPath,
+          "-f",
+          "segment",
+          "-segment_time",
+          String(ZHIPU_SEGMENT_SECONDS),
+          "-reset_timestamps",
+          "1",
+          "-ar",
+          "16000",
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_s16le",
+          outputPattern,
+        ],
+        { maxBuffer: 50 * 1024 * 1024 },
+      );
+
+      const segments = (await readdir(tempDir))
+        .filter((entry) => entry.startsWith(`${baseName}-`) && entry.endsWith(".wav"))
+        .sort()
+        .map((entry) => ({
+          path: join(tempDir, entry),
+          fileName: basename(entry),
+        }));
+
+      if (segments.length === 0) {
+        throw new AudioTranscriptionError("音频切片失败: ffmpeg 未生成任何分段");
+      }
+
+      return {
+        segments,
+        cleanup: async () => {
+          await rm(tempDir, { recursive: true, force: true });
+        },
+      };
+    } catch (error) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      const err = error as NodeJS.ErrnoException;
+      if (err?.code === "ENOENT") {
+        throw new AudioTranscriptionError(
+          "音频切片失败: ffmpeg not found in PATH",
+          error,
+        );
+      }
+      if (error instanceof AudioTranscriptionError) {
+        throw error;
+      }
+      throw new AudioTranscriptionError(
+        `音频切片失败: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+      );
     }
   }
 
