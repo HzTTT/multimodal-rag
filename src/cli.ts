@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-runtime";
 import { stat } from "node:fs/promises";
 import { buildMultimodalRagDoctorReport } from "./doctor.js";
+import { startHttpServer } from "./http-server.js";
 import type { MultimodalRagRuntime } from "./runtime.js";
 
 function isMissingPathError(error: unknown): boolean {
@@ -368,6 +369,62 @@ export function registerMultimodalRagCli(
       "cleanup-failed-audio",
       "兼容旧命令：清理历史失败导致的脏媒体索引（音频/图片）",
     );
+
+    // openclaw multimodal-rag serve
+    rag
+      .command("serve")
+      .description("启动本地 HTTP 接口：POST /get_file_info、GET /search_file")
+      .option("--host <host>", "绑定地址，默认 127.0.0.1", "127.0.0.1")
+      .option("--port <port>", "监听端口，默认 7749", "7749")
+      .option("--search-limit <n>", "/search_file 返回条数上限", "20")
+      .option("--search-min-score <n>", "/search_file 最低匹配分数 0-1", "0.25")
+      .option(
+        "--enable-index-on-demand",
+        "当 /get_file_info 遇到未索引文件时，允许同步调用 watcher.indexPath（会拖慢响应）",
+        false,
+      )
+      .action(async (opts: any) => {
+        const port = parseCliInteger(opts.port, "port", { min: 1, defaultValue: 7749 });
+        const host = typeof opts.host === "string" && opts.host.trim() ? opts.host.trim() : "127.0.0.1";
+        const searchLimit = parseCliInteger(opts.searchLimit, "search-limit", {
+          min: 1,
+          defaultValue: 20,
+        });
+        const rawMinScore = Number(opts.searchMinScore ?? 0.25);
+        if (!Number.isFinite(rawMinScore) || rawMinScore < 0 || rawMinScore > 1) {
+          console.error("search-min-score 必须是 0-1 之间的数字");
+          process.exit(1);
+        }
+
+        try {
+          const server = await startHttpServer({
+            host,
+            port,
+            storage,
+            embeddings,
+            watcher: opts.enableIndexOnDemand ? watcher : undefined,
+            searchLimit,
+            searchMinScore: rawMinScore,
+          });
+          console.log(`✓ multimodal-rag HTTP 服务已启动: http://${host}:${port}`);
+          console.log("  POST /get_file_info  入参: JSON 路径数组");
+          console.log("  GET  /search_file?q=<keyword>");
+          if (opts.enableIndexOnDemand) {
+            console.log("  (已启用 --enable-index-on-demand：未索引文件会同步触发索引)");
+          }
+
+          const shutdown = () => {
+            console.log("\n正在关闭 HTTP 服务…");
+            server.close(() => process.exit(0));
+            setTimeout(() => process.exit(0), 3000).unref();
+          };
+          process.once("SIGINT", shutdown);
+          process.once("SIGTERM", shutdown);
+        } catch (error) {
+          console.error(`HTTP 服务启动失败: ${String(error)}`);
+          process.exit(1);
+        }
+      });
 
     // openclaw multimodal-rag reindex
     rag
