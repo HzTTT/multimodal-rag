@@ -775,7 +775,11 @@ export class MediaWatcher {
     const pathStats = await stat(resolvedPath);
 
     if (pathStats.isDirectory()) {
-      const supportedExts = [...this.config.fileTypes.image, ...this.config.fileTypes.audio];
+      const supportedExts = [
+        ...this.config.fileTypes.image,
+        ...this.config.fileTypes.audio,
+        ...this.config.fileTypes.document,
+      ];
       const files = await this.scanDirectory(resolvedPath, supportedExts);
       const failures: string[] = [];
 
