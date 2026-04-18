@@ -196,6 +196,21 @@ export type PluginConfig = {
   watchDebounceMs: number;
   indexExistingOnStart: boolean;
   notifications: NotificationConfig;
+  http: HttpServerConfig;
+};
+
+/**
+ * HTTP 接入服务配置（/get_file_info + /search_file）
+ * 启用后由插件运行时在 gateway 启动时自动拉起，gateway 关停时自动停止。
+ * 与 `openclaw multimodal-rag serve` CLI 命令共用实现。
+ */
+export type HttpServerConfig = {
+  enabled: boolean; // 默认 false，保持升级无感知；手动 config set 后自动启动
+  host: string; // 默认 "127.0.0.1"，仅本机访问
+  port: number; // 默认 7749
+  searchLimit: number; // /search_file 返回条数上限，默认 20
+  searchMinScore: number; // /search_file 最低匹配分数（0-1），默认 0.25
+  enableIndexOnDemand: boolean; // /get_file_info 命中未索引时是否同步 indexPath，默认 false
 };
 
 /**

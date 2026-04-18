@@ -108,6 +108,19 @@ openclaw config set plugins.entries.multimodal-rag.enabled true --strict-json
 
 > `notifications` 字段如何驱动 agent 命令、目标解析顺序、批次状态机请见 [notifications.md](./notifications.md)。
 
+### 2.8 `http`（可选的 HTTP 接入服务）
+
+| 路径 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `http.enabled` | `boolean` | `false` | 开启后插件的 `multimodal-rag-http` service 会在 gateway 启动时自动拉起 `/get_file_info` + `/search_file`，gateway 停止时自动关停。升级现有环境不会主动开这个端口。 |
+| `http.host` | `string` | `"127.0.0.1"` | 监听地址。跨机访问改 `"0.0.0.0"` 或具体内网 IP；注意后者无鉴权。 |
+| `http.port` | `number` | `7749` | 监听端口。 |
+| `http.searchLimit` | `number` | `20` | `/search_file` 返回条数上限。 |
+| `http.searchMinScore` | `number` | `0.25` | `/search_file` 最低匹配分数（0-1），同时作用于 media 和 doc_chunks 两表。 |
+| `http.enableIndexOnDemand` | `boolean` | `false` | `/get_file_info` 命中未索引文件时是否同步触发 `watcher.indexPath`；会拖慢响应，默认关闭。 |
+
+> 实现见 `src/runtime.ts:registerMultimodalRagHttpService`，HTTP 契约见 [http-api.md](./http-api.md)。同一台机器上避免再跑 `openclaw multimodal-rag serve` CLI，否则端口冲突。
+
 ---
 
 ## 3. provider 分支决策

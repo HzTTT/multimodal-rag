@@ -1,3 +1,4 @@
+import type { Server } from "node:http";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-runtime";
 import {
   createEmbeddingProvider,
@@ -8,6 +9,7 @@ import {
   MediaWatcher,
   resolveWhisperBin,
 } from "../plugin-runtime.js";
+import { startHttpServer } from "./http-server.js";
 import {
   collectDeferredConfigWarnings,
   collectWatcherStartupBlockers,
@@ -39,6 +41,7 @@ export type MultimodalRagRuntime = {
   vectorDim: number;
   deferredWarnings: string[];
   watcherStartupBlockers: string[];
+  httpServer?: Server; // 由 http service 在 start 时填充、stop 时清空
 };
 
 const runtimeCache = new WeakMap<object, MultimodalRagRuntime>();
@@ -186,6 +189,62 @@ export function registerMultimodalRagService(
     stop: async () => {
       await runtime.watcher.stop();
       api.logger.info?.("multimodal-rag: File watcher stopped");
+    },
+  });
+}
+
+/**
+ * 注册 HTTP 服务（/get_file_info + /search_file），随 gateway 生命周期自动启停。
+ * 仅当 config.http.enabled === true 时实际监听端口；否则 start 直接返回。
+ */
+export function registerMultimodalRagHttpService(
+  api: OpenClawPluginApi,
+  runtime: MultimodalRagRuntime,
+): void {
+  api.registerService({
+    id: "multimodal-rag-http",
+    start: async () => {
+      const httpCfg = runtime.config.http;
+      if (!httpCfg.enabled) {
+        api.logger.info?.(
+          "multimodal-rag: HTTP service disabled (config.http.enabled=false)",
+        );
+        return;
+      }
+      try {
+        runtime.httpServer = await startHttpServer({
+          host: httpCfg.host,
+          port: httpCfg.port,
+          storage: runtime.storage,
+          embeddings: runtime.embeddings,
+          watcher: httpCfg.enableIndexOnDemand ? runtime.watcher : undefined,
+          searchLimit: httpCfg.searchLimit,
+          searchMinScore: httpCfg.searchMinScore,
+        });
+        api.logger.info?.(
+          `multimodal-rag: HTTP service listening on http://${httpCfg.host}:${httpCfg.port}`,
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        api.logger.warn?.(
+          `multimodal-rag: HTTP service failed to start (${httpCfg.host}:${httpCfg.port}): ${message}`,
+        );
+      }
+    },
+    stop: async () => {
+      const server = runtime.httpServer;
+      if (!server) {
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        // node 的 server.close 只会拒绝新连接，保留现有连接
+        // setTimeout 5s 兜底，避免关闭时被长连接拖住
+        setTimeout(() => resolve(), 5000).unref?.();
+      });
+      runtime.httpServer = undefined;
+      api.logger.info?.("multimodal-rag: HTTP service stopped");
     },
   });
 }

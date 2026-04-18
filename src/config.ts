@@ -47,6 +47,12 @@ export const DEFAULT_CHUNK_SIZE = 800;
 export const DEFAULT_CHUNK_OVERLAP = 120;
 export const DEFAULT_OCR_TRIGGER_CHARS = 30;
 export const DEFAULT_OCR_ENABLED = true;
+export const DEFAULT_HTTP_ENABLED = false;
+export const DEFAULT_HTTP_HOST = "127.0.0.1";
+export const DEFAULT_HTTP_PORT = 7749;
+export const DEFAULT_HTTP_SEARCH_LIMIT = 20;
+export const DEFAULT_HTTP_SEARCH_MIN_SCORE = 0.25;
+export const DEFAULT_HTTP_ENABLE_INDEX_ON_DEMAND = false;
 
 const notificationTargetSchema = Type.Object(
   {
@@ -138,6 +144,25 @@ const configSchema = Type.Object(
       Type.Number({ default: DEFAULT_WATCH_DEBOUNCE_MS }),
     ),
     indexExistingOnStart: Type.Optional(Type.Boolean({ default: true })),
+    http: Type.Optional(
+      Type.Object(
+        {
+          enabled: Type.Optional(Type.Boolean({ default: DEFAULT_HTTP_ENABLED })),
+          host: Type.Optional(Type.String({ default: DEFAULT_HTTP_HOST })),
+          port: Type.Optional(Type.Number({ default: DEFAULT_HTTP_PORT })),
+          searchLimit: Type.Optional(
+            Type.Number({ default: DEFAULT_HTTP_SEARCH_LIMIT }),
+          ),
+          searchMinScore: Type.Optional(
+            Type.Number({ default: DEFAULT_HTTP_SEARCH_MIN_SCORE }),
+          ),
+          enableIndexOnDemand: Type.Optional(
+            Type.Boolean({ default: DEFAULT_HTTP_ENABLE_INDEX_ON_DEMAND }),
+          ),
+        },
+        { additionalProperties: false, default: {} },
+      ),
+    ),
     notifications: Type.Optional(
       Type.Object(
         {
@@ -240,6 +265,16 @@ export function normalizePluginConfig(
     dbPath: userConfig.dbPath || DEFAULT_DB_PATH,
     watchDebounceMs: userConfig.watchDebounceMs || DEFAULT_WATCH_DEBOUNCE_MS,
     indexExistingOnStart: userConfig.indexExistingOnStart !== false,
+    http: {
+      enabled: userConfig.http?.enabled ?? DEFAULT_HTTP_ENABLED,
+      host: userConfig.http?.host || DEFAULT_HTTP_HOST,
+      port: userConfig.http?.port ?? DEFAULT_HTTP_PORT,
+      searchLimit: userConfig.http?.searchLimit ?? DEFAULT_HTTP_SEARCH_LIMIT,
+      searchMinScore:
+        userConfig.http?.searchMinScore ?? DEFAULT_HTTP_SEARCH_MIN_SCORE,
+      enableIndexOnDemand:
+        userConfig.http?.enableIndexOnDemand ?? DEFAULT_HTTP_ENABLE_INDEX_ON_DEMAND,
+    },
     notifications: {
       enabled: userConfig.notifications?.enabled ?? false,
       agentId: userConfig.notifications?.agentId,

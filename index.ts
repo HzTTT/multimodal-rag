@@ -9,6 +9,7 @@ import { multimodalRagConfigSchema } from "./src/config.js";
 import { logMultimodalRagDoctorReport } from "./src/doctor.js";
 import {
   createMultimodalRagRuntime,
+  registerMultimodalRagHttpService,
   registerMultimodalRagService,
   registerMultimodalRagTools,
 } from "./src/runtime.js";
@@ -110,10 +111,11 @@ const multimodalRagPlugin = definePluginEntryCompat({
     registerMultimodalRagCli(api, runtime);
 
     // ========================================================================
-    // 注册服务（文件监听）
+    // 注册服务（文件监听 + 可选 HTTP 接入）
     // ========================================================================
 
     registerMultimodalRagService(api, runtime);
+    registerMultimodalRagHttpService(api, runtime);
 
     api.logger.info?.(
       `multimodal-rag: Plugin initialized (db: ${resolvedDbPath})`,

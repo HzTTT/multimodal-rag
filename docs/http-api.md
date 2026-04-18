@@ -223,3 +223,41 @@ HTTP 404
 - `pdftoppm`（poppler）仅在 PDF 扫描页 OCR 回落时需要；纯文本 PDF 不依赖。
 - Ollama VLM（`ocrModel` 或 `visionModel` fallback）在 OCR 开启时需要可用。
 - `officeparser` / `pdfjs-dist` 是插件 npm 依赖，随 `npm install` 到位。
+
+---
+
+## 7. 生命周期模式
+
+HTTP 服务有两种启动方式：
+
+### 7.1 随 gateway 生命周期（推荐，0.5.1+）
+
+插件注册了 `multimodal-rag-http` service，当 `config.http.enabled === true` 时，gateway 启动会自动拉起 HTTP 监听；gateway 停止会 `server.close()`。代码在 `src/runtime.ts:registerMultimodalRagHttpService`。
+
+```bash
+# 一键开启
+openclaw config set plugins.entries.multimodal-rag.config.http.enabled true --strict-json
+systemctl --user restart openclaw-gateway.service
+curl "http://127.0.0.1:7749/search_file?q=关键词"
+```
+
+默认值：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `http.enabled` | `false` | 升级无感知；显式 `true` 才自动启动 |
+| `http.host` | `"127.0.0.1"` | 仅本机；跨机访问改 `0.0.0.0` |
+| `http.port` | `7749` | 监听端口 |
+| `http.searchLimit` | `20` | `/search_file` 返回数上限 |
+| `http.searchMinScore` | `0.25` | `/search_file` 最低匹配分数 |
+| `http.enableIndexOnDemand` | `false` | `/get_file_info` 未索引时是否同步 `indexPath` |
+
+### 7.2 独立 CLI 进程（headless / cross-machine）
+
+若 gateway 不在当前机器、或需临时绑定 `0.0.0.0` / 换端口，仍可用原 CLI 命令：
+
+```bash
+openclaw multimodal-rag serve --host 0.0.0.0 --port 7749
+```
+
+CLI serve 与 service 会争抢同一个端口，不要同时启动两者。

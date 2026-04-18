@@ -155,6 +155,43 @@
         "default": true,
         "description": "启动时是否索引现有文件"
       },
+      "http": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "启用 HTTP 服务（/get_file_info + /search_file），随 gateway 生命周期自动启停"
+          },
+          "host": {
+            "type": "string",
+            "default": "127.0.0.1",
+            "description": "HTTP 绑定地址；默认仅本机访问，如需跨机请显式改为 0.0.0.0 或具体 IP"
+          },
+          "port": {
+            "type": "number",
+            "default": 7749,
+            "description": "HTTP 监听端口"
+          },
+          "searchLimit": {
+            "type": "number",
+            "default": 20,
+            "description": "/search_file 返回条数上限"
+          },
+          "searchMinScore": {
+            "type": "number",
+            "default": 0.25,
+            "description": "/search_file 最低匹配分数 (0-1)"
+          },
+          "enableIndexOnDemand": {
+            "type": "boolean",
+            "default": false,
+            "description": "/get_file_info 命中未索引文件时是否同步触发 indexPath（会拖慢响应）"
+          }
+        },
+        "default": {}
+      },
       "notifications": {
         "type": "object",
         "additionalProperties": false,
