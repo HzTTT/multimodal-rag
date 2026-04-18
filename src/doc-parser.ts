@@ -5,9 +5,11 @@
 
 import { readFile, mkdtemp, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
 import type { ChunkerSegment } from "./doc-chunker.js";
 import type { DocumentParseContext, IOcrProvider } from "./types.js";
@@ -72,13 +74,32 @@ function loadPdfjs(): Promise<any> {
   return pdfjsPromise;
 }
 
+const requireFromHere = createRequire(import.meta.url);
+
+let pdfjsAssetsCache: { cMapUrl: string; standardFontDataUrl: string } | null = null;
+function resolvePdfjsAssets(): { cMapUrl: string; standardFontDataUrl: string } {
+  if (!pdfjsAssetsCache) {
+    const root = dirname(requireFromHere.resolve("pdfjs-dist/package.json"));
+    pdfjsAssetsCache = {
+      cMapUrl: pathToFileURL(join(root, "cmaps") + "/").href,
+      standardFontDataUrl: pathToFileURL(join(root, "standard_fonts") + "/").href,
+    };
+  }
+  return pdfjsAssetsCache;
+}
+
 async function parsePdf(ctx: DocumentParseContext): Promise<ChunkerSegment[]> {
   const pdfjsLib = await loadPdfjs();
   const buffer = await readFile(ctx.filePath);
   const data = new Uint8Array(buffer);
 
+  const { cMapUrl, standardFontDataUrl } = resolvePdfjsAssets();
+
   const loadingTask = pdfjsLib.getDocument({
     data,
+    cMapUrl,
+    cMapPacked: true,
+    standardFontDataUrl,
     disableFontFace: true,
     isEvalSupported: false,
     useSystemFonts: false,
