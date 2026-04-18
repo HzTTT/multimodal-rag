@@ -19,6 +19,17 @@ export const DEFAULT_AUDIO_EXTENSIONS = [
   ".flac",
   ".aac",
 ];
+export const DEFAULT_DOCUMENT_EXTENSIONS = [
+  ".pdf",
+  ".docx",
+  ".xlsx",
+  ".pptx",
+  ".txt",
+  ".md",
+  ".markdown",
+  ".html",
+  ".htm",
+];
 export const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
 export const DEFAULT_VISION_MODEL = "qwen3-vl:2b";
 export const DEFAULT_EMBED_MODEL = "qwen3-embedding:latest";
@@ -32,6 +43,10 @@ export const DEFAULT_WHISPER_PROVIDER = "local";
 export const DEFAULT_EMBEDDING_PROVIDER = "ollama";
 export const DEFAULT_WHISPER_MODEL = "glm-asr-2512";
 export const DEFAULT_WHISPER_LANGUAGE = "zh";
+export const DEFAULT_CHUNK_SIZE = 800;
+export const DEFAULT_CHUNK_OVERLAP = 120;
+export const DEFAULT_OCR_TRIGGER_CHARS = 30;
+export const DEFAULT_OCR_ENABLED = true;
 
 const notificationTargetSchema = Type.Object(
   {
@@ -54,6 +69,9 @@ const configSchema = Type.Object(
           audio: Type.Optional(
             Type.Array(Type.String(), { default: DEFAULT_AUDIO_EXTENSIONS }),
           ),
+          document: Type.Optional(
+            Type.Array(Type.String(), { default: DEFAULT_DOCUMENT_EXTENSIONS }),
+          ),
         },
         { additionalProperties: false, default: {} },
       ),
@@ -65,6 +83,7 @@ const configSchema = Type.Object(
           apiKey: Type.Optional(Type.String()),
           visionModel: Type.Optional(Type.String({ default: DEFAULT_VISION_MODEL })),
           embedModel: Type.Optional(Type.String({ default: DEFAULT_EMBED_MODEL })),
+          ocrModel: Type.Optional(Type.String()),
         },
         { additionalProperties: false, default: {} },
       ),
@@ -97,6 +116,19 @@ const configSchema = Type.Object(
           zhipuApiBaseUrl: Type.Optional(Type.String()),
           zhipuModel: Type.Optional(Type.String({ default: DEFAULT_WHISPER_MODEL })),
           language: Type.Optional(Type.String({ default: DEFAULT_WHISPER_LANGUAGE })),
+        },
+        { additionalProperties: false, default: {} },
+      ),
+    ),
+    document: Type.Optional(
+      Type.Object(
+        {
+          chunkSize: Type.Optional(Type.Number({ default: DEFAULT_CHUNK_SIZE })),
+          chunkOverlap: Type.Optional(Type.Number({ default: DEFAULT_CHUNK_OVERLAP })),
+          ocrTriggerChars: Type.Optional(
+            Type.Number({ default: DEFAULT_OCR_TRIGGER_CHARS }),
+          ),
+          ocrEnabled: Type.Optional(Type.Boolean({ default: DEFAULT_OCR_ENABLED })),
         },
         { additionalProperties: false, default: {} },
       ),
@@ -177,12 +209,14 @@ export function normalizePluginConfig(
     fileTypes: {
       image: userConfig.fileTypes?.image || DEFAULT_IMAGE_EXTENSIONS,
       audio: userConfig.fileTypes?.audio || DEFAULT_AUDIO_EXTENSIONS,
+      document: userConfig.fileTypes?.document || DEFAULT_DOCUMENT_EXTENSIONS,
     },
     ollama: {
       baseUrl: userConfig.ollama?.baseUrl || DEFAULT_OLLAMA_BASE_URL,
       apiKey: userConfig.ollama?.apiKey,
       visionModel: userConfig.ollama?.visionModel || DEFAULT_VISION_MODEL,
       embedModel: userConfig.ollama?.embedModel || DEFAULT_EMBED_MODEL,
+      ocrModel: userConfig.ollama?.ocrModel,
     },
     embedding: {
       provider: userConfig.embedding?.provider || DEFAULT_EMBEDDING_PROVIDER,
@@ -195,6 +229,13 @@ export function normalizePluginConfig(
       zhipuApiBaseUrl: userConfig.whisper?.zhipuApiBaseUrl,
       zhipuModel: userConfig.whisper?.zhipuModel || DEFAULT_WHISPER_MODEL,
       language: userConfig.whisper?.language || DEFAULT_WHISPER_LANGUAGE,
+    },
+    document: {
+      chunkSize: userConfig.document?.chunkSize ?? DEFAULT_CHUNK_SIZE,
+      chunkOverlap: userConfig.document?.chunkOverlap ?? DEFAULT_CHUNK_OVERLAP,
+      ocrTriggerChars:
+        userConfig.document?.ocrTriggerChars ?? DEFAULT_OCR_TRIGGER_CHARS,
+      ocrEnabled: userConfig.document?.ocrEnabled ?? DEFAULT_OCR_ENABLED,
     },
     dbPath: userConfig.dbPath || DEFAULT_DB_PATH,
     watchDebounceMs: userConfig.watchDebounceMs || DEFAULT_WATCH_DEBOUNCE_MS,
@@ -229,8 +270,14 @@ export function buildDependencyHints(
         }
       : {}),
     ffmpegRequired: true,
+    pdfRenderRequired: config.document.ocrEnabled,
     ollamaRequiredForImage: true,
     ollamaRequiredForEmbedding: config.embedding.provider === "ollama",
+    ollamaRequiredForOcr:
+      config.document.ocrEnabled && (config.ollama.ocrModel || config.ollama.visionModel)
+        ? true
+        : false,
+    ocrModel: config.ollama.ocrModel || config.ollama.visionModel,
     openaiKeyConfigured:
       config.embedding.provider !== "openai" || !!config.embedding.openaiApiKey,
   };
@@ -248,6 +295,12 @@ export function collectDeferredConfigWarnings(config: PluginConfig): string[] {
   if (config.whisper.provider === "zhipu" && !config.whisper.zhipuApiKey) {
     warnings.push(
       "whisper.provider=zhipu 但未配置 whisper.zhipuApiKey；插件已加载，但音频转录会在执行时失败",
+    );
+  }
+
+  if (config.document.chunkOverlap >= config.document.chunkSize) {
+    warnings.push(
+      `document.chunkOverlap (${config.document.chunkOverlap}) 必须小于 document.chunkSize (${config.document.chunkSize})；将按 0 overlap 处理`,
     );
   }
 

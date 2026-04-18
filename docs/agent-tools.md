@@ -472,6 +472,17 @@ graph TD
 
 ---
 
+## 文档（document）类型支持
+
+四个工具均兼容 `document`，统一覆盖 image / audio / document：
+
+- `media_search`：新增 `type='document'`，默认 `type='all'` 会并发查 media 与 doc_chunks 两张表并按 score 合并；文档结果**按 filePath 聚合**（每文件一行 + 最高分 chunk 的 ~120 字 snippet + 页码/标题锚点）。底层调 `storage.unifiedSearch`。
+- `media_list`：新增 `type='document'`，走 `storage.listDocSummaries`，**不走磁盘兜底**（文档无 image/audio 那种"未索引但已存在"的 fallback 语义）。
+- `media_describe`：先看 media 表 `findByPath`；未命中则看 `findDocChunksByPath`。文档路径返回"前 3 段预览 + 总段数/字符数 + 页码/标题锚点"。
+- `media_stats`：返回 `imageCount / audioCount / docCount / docChunksCount` 四项。
+
+> 聚合策略与 snippet 长度由 `src/tools.ts:formatUnifiedHit` 与 `storage.searchDocsAggregated` 决定（默认 `snippetMaxChars=120`）。
+
 ## 相关文档
 
 - 命令行入口：[`cli-reference.md`](./cli-reference.md)

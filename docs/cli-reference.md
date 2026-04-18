@@ -356,6 +356,18 @@ graph TD
 
 ---
 
+## 文档（document）类型支持
+
+现有 9 个命令对 document 的行为调整如下：
+
+- `stats`：额外打印 `文档: M 份 (K 个切片)`；data 由 `storage.countDocs()` 与 `storage.countDocChunks()` 合计。
+- `search`：保留原参数，命中结果里混入 document 时自动展示 snippet（文档侧 minScore 同 0.3）。
+- `list`：`--type document` 新增，走 `storage.listDocSummaries`，输出按 filePath 聚合。
+- `cleanup-missing`：并行清理 media 表与 doc_chunks 表（内部调 `cleanupMissingDocChunks` 按路径去重扫描）。
+- `reindex`：会同时清空两张表并重新扫描，`supportedExts` 自动包含 `fileTypes.document`。
+- `doctor`：`runtimeConfig` 多出 `ocrModel / ocrEnabled / documentChunkSize / documentChunkOverlap / documentOcrTriggerChars` 字段。
+- `serve`：HTTP 契约同步扩展，见 [`http-api.md`](./http-api.md)。
+
 ## 相关文档
 
 - Agent 工具入口：[`agent-tools.md`](./agent-tools.md)

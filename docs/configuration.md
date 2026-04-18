@@ -51,8 +51,9 @@ openclaw config set plugins.entries.multimodal-rag.enabled true --strict-json
 |---|---|---|---|
 | `fileTypes.image` | `string[]` | `[".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"]` | 视觉路径接受的扩展名（小写比较）。 |
 | `fileTypes.audio` | `string[]` | `[".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac"]` | Whisper/GLM-ASR 路径接受的扩展名（小写比较）。 |
+| `fileTypes.document` | `string[]` | `[".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".markdown", ".html", ".htm"]` | 文档解析路径接受的扩展名（小写比较）；PDF 用 `pdfjs-dist`，Office 用 `officeparser`，纯文本/HTML 直接读。 |
 
-> 文件类型由扩展名直接判定。修改 `fileTypes` 不会改变现有索引；只影响新事件被分发到 image/audio 哪个处理路径。
+> 文件类型由扩展名直接判定。修改 `fileTypes` 不会改变现有索引；只影响新事件被分发到 image/audio/document 哪个处理路径。
 
 ### 2.3 `ollama`
 
@@ -62,6 +63,7 @@ openclaw config set plugins.entries.multimodal-rag.enabled true --strict-json
 | `ollama.apiKey` | `string?` | — | 远程 Ollama / API 网关时的鉴权。配置后 `Authorization: Bearer <apiKey>` 与 `api-key: <apiKey>` 同时附在所有 Ollama 请求和健康检查上。 |
 | `ollama.visionModel` | `string` | `qwen3-vl:2b` | 图像描述模型；走 Ollama chat 接口。 |
 | `ollama.embedModel` | `string` | `qwen3-embedding:latest` | 嵌入模型；维度由模型名推断（见 §3）。 |
+| `ollama.ocrModel` | `string?` | — | 文档/图片 OCR 使用的 VLM 模型。留空则复用 `visionModel`。可填 `gemma3:27b` / `qwen2.5-vl:32b` 等做 A/B。 |
 
 ### 2.4 `embedding`
 
@@ -81,7 +83,18 @@ openclaw config set plugins.entries.multimodal-rag.enabled true --strict-json
 | `whisper.zhipuModel` | `string` | `glm-asr-2512` | GLM-ASR 模型 id。 |
 | `whisper.language` | `string` | `zh` | 仅 `provider=local` 使用，作为 Whisper CLI 的 `--language` 参数。 |
 
-### 2.6 `notifications`
+### 2.6 `document`
+
+| 路径 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `document.chunkSize` | `number` | `800` | 递归切片的目标字符数；单 chunk 最大近似上限。过小会增加 chunk 数量与 embedding 开销；过大会稀释向量表征。 |
+| `document.chunkOverlap` | `number` | `120` | 相邻 chunk 之间的重叠字符数，避免语义断在句子中间。必须 `< chunkSize`，否则归一化为 `0`。 |
+| `document.ocrTriggerChars` | `number` | `30` | PDF 一页经 `pdfjs` 提取的字符数低于该阈值时，视为扫描页并回落到 OCR。 |
+| `document.ocrEnabled` | `boolean` | `true` | 关闭时扫描页将被当作空白跳过；文本层缺失的 PDF 会索引为空或按当前稀疏文本入库。 |
+
+> 切分算法在 `src/doc-chunker.ts`。解析分派在 `src/doc-parser.ts`。OCR provider 在 `src/ocr.ts`。文档索引主链路见 [indexing-pipeline.md](./indexing-pipeline.md)。
+
+### 2.7 `notifications`
 
 | 路径 | 类型 | 默认值 | 说明 |
 |---|---|---|---|

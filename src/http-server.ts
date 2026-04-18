@@ -51,6 +51,17 @@ type FileInfoError = {
 
 const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".bmp"]);
 const AUDIO_EXTS = new Set([".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus"]);
+const DOC_EXTS = new Set([
+  ".pdf",
+  ".docx",
+  ".xlsx",
+  ".pptx",
+  ".txt",
+  ".md",
+  ".markdown",
+  ".html",
+  ".htm",
+]);
 
 const MIME_MAP: Record<string, string> = {
   ".jpg": "image/jpeg",
@@ -68,6 +79,15 @@ const MIME_MAP: Record<string, string> = {
   ".ogg": "audio/ogg",
   ".flac": "audio/flac",
   ".opus": "audio/opus",
+  ".pdf": "application/pdf",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".markdown": "text/markdown",
+  ".html": "text/html",
+  ".htm": "text/html",
 };
 
 function expandPath(p: string): string {
@@ -96,6 +116,9 @@ function detectKind(ext: string): MediaType | "other" {
   }
   if (AUDIO_EXTS.has(e)) {
     return "audio";
+  }
+  if (DOC_EXTS.has(e)) {
+    return "document";
   }
   return "other";
 }
@@ -238,12 +261,32 @@ async function buildFileInfo(
 
   const ext = extname(absolute);
   const kind = detectKind(ext);
-  const entry = await deps.storage.findByPath(absolute);
 
-  const description =
-    entry?.description ?? (await resolveUnindexedDescription(absolute, deps));
+  let description: string;
+  let timeTs: number;
 
-  const timeTs = entry?.fileCreatedAt ?? stats.mtimeMs;
+  if (kind === "document") {
+    const chunks = await deps.storage.findDocChunksByPath(absolute);
+    if (chunks.length > 0) {
+      const sorted = chunks.slice().sort((a, b) => a.chunkIndex - b.chunkIndex);
+      const joined = sorted
+        .slice(0, 3)
+        .map((c) => c.chunkText)
+        .join("\n\n");
+      description =
+        joined.length > 1200 ? joined.slice(0, 1200) + "…" : joined;
+      timeTs = sorted[0].fileCreatedAt;
+    } else {
+      description = await resolveUnindexedDescription(absolute, deps);
+      timeTs = stats.mtimeMs;
+    }
+  } else {
+    const entry = await deps.storage.findByPath(absolute);
+    description =
+      entry?.description ?? (await resolveUnindexedDescription(absolute, deps));
+    timeTs = entry?.fileCreatedAt ?? stats.mtimeMs;
+  }
+
   const gps = kind === "image" ? await readImageGps(absolute) : undefined;
 
   return {
@@ -318,17 +361,25 @@ export function createHttpServer(options: HttpServerOptions): Server {
           return;
         }
         const vector = await embeddings.embed(q);
-        const results = await storage.search(vector, {
+        const unified = await storage.unifiedSearch(vector, {
           type: "all",
           limit: searchLimit,
           minScore: searchMinScore,
           dedupeByHash: true,
         });
-        sendJson(
-          res,
-          200,
-          results.map((r) => r.entry.filePath),
+        const paths = unified.map((r) =>
+          r.kind === "media" ? r.entry.filePath : r.doc.filePath,
         );
+        // 去重（同一文档可能被多个 chunk 命中，upstream 已聚合但保险）
+        const uniquePaths: string[] = [];
+        const seen = new Set<string>();
+        for (const p of paths) {
+          if (!seen.has(p)) {
+            seen.add(p);
+            uniquePaths.push(p);
+          }
+        }
+        sendJson(res, 200, uniquePaths);
         return;
       }
 

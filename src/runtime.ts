@@ -3,6 +3,7 @@ import {
   createEmbeddingProvider,
   IndexNotifier,
   createMediaProcessor,
+  createOllamaVlmOcrProvider,
   MediaStorage,
   MediaWatcher,
   resolveWhisperBin,
@@ -18,7 +19,12 @@ import {
   createMediaSearchTool,
   createMediaStatsTool,
 } from "./tools.js";
-import type { IEmbeddingProvider, IMediaProcessor, PluginConfig } from "./types.js";
+import type {
+  IEmbeddingProvider,
+  IMediaProcessor,
+  IOcrProvider,
+  PluginConfig,
+} from "./types.js";
 
 export type MultimodalRagRuntime = {
   config: PluginConfig;
@@ -27,6 +33,7 @@ export type MultimodalRagRuntime = {
   embeddings: IEmbeddingProvider;
   storage: MediaStorage;
   processor: IMediaProcessor;
+  ocr?: IOcrProvider;
   watcher: MediaWatcher;
   notifier?: IndexNotifier;
   vectorDim: number;
@@ -71,6 +78,24 @@ function createDeferredEmbeddingProvider(config: PluginConfig): IEmbeddingProvid
   };
 }
 
+/**
+ * 构造 OCR provider：默认复用 Ollama VLM（visionModel 或自定义 ocrModel）
+ */
+function createOcrProviderIfEnabled(config: PluginConfig): IOcrProvider | undefined {
+  if (!config.document.ocrEnabled) {
+    return undefined;
+  }
+  const model = config.ollama.ocrModel || config.ollama.visionModel;
+  if (!model) {
+    return undefined;
+  }
+  return createOllamaVlmOcrProvider({
+    baseUrl: config.ollama.baseUrl,
+    apiKey: config.ollama.apiKey,
+    model,
+  });
+}
+
 export function createMultimodalRagRuntime(api: OpenClawPluginApi): MultimodalRagRuntime {
   const cached = runtimeCache.get(api as object);
   if (cached) {
@@ -85,16 +110,30 @@ export function createMultimodalRagRuntime(api: OpenClawPluginApi): MultimodalRa
   const deferredWarnings = collectDeferredConfigWarnings(config);
   const watcherStartupBlockers = collectWatcherStartupBlockers(config);
   const storage = new MediaStorage(resolvedDbPath, vectorDim);
+  const ocr = createOcrProviderIfEnabled(config);
   const processor = createMediaProcessor({
     ollamaBaseUrl: config.ollama.baseUrl,
     ollamaApiKey: config.ollama.apiKey,
     visionModel: config.ollama.visionModel,
     whisper: config.whisper,
+    document: {
+      chunkSize: config.document.chunkSize,
+      chunkOverlap: config.document.chunkOverlap,
+      ocrTriggerChars: config.document.ocrTriggerChars,
+    },
+    ocr,
   });
   const notifier = config.notifications?.enabled
     ? new IndexNotifier(config.notifications, api.runtime, api.logger, api.config)
     : undefined;
-  const watcher = new MediaWatcher(config, storage, embeddings, processor, api.logger, notifier);
+  const watcher = new MediaWatcher(
+    config,
+    storage,
+    embeddings,
+    processor,
+    api.logger,
+    notifier,
+  );
 
   const runtime: MultimodalRagRuntime = {
     config,
@@ -103,6 +142,7 @@ export function createMultimodalRagRuntime(api: OpenClawPluginApi): MultimodalRa
     embeddings,
     storage,
     processor,
+    ocr,
     watcher,
     notifier,
     vectorDim,

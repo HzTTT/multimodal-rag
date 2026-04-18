@@ -1,6 +1,7 @@
 export { createEmbeddingProvider } from "./src/embeddings.js";
 export { IndexNotifier } from "./src/notifier.js";
 export { createMediaProcessor } from "./src/processor.js";
+export { createOllamaVlmOcrProvider, OllamaVlmOcrProvider } from "./src/ocr.js";
 export { MediaStorage } from "./src/storage.js";
 export {
   createMediaDescribeTool,

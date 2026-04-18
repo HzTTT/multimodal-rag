@@ -10,3 +10,5 @@ dist/
 /.cocoindex_code/
 # OMX runtime state
 /.omx/
+# OMC orchestration state (local only)
+.omc/

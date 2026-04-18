@@ -4,8 +4,14 @@
 
 import { readFile } from "node:fs/promises";
 import { extname, join } from "node:path";
-import type { IMediaProcessor } from "./types.js";
+import type {
+  DocumentProcessResult,
+  IMediaProcessor,
+  IOcrProvider,
+} from "./types.js";
 import { resolveWhisperBin } from "./whisper-bin.js";
+import { parseDocument } from "./doc-parser.js";
+import { recursiveChunk } from "./doc-chunker.js";
 
 const AUDIO_FAILURE_PATTERN = /^[（(]\s*转录失败[:：]/;
 
@@ -55,6 +61,12 @@ type WhisperConfig = {
   language?: string;
 };
 
+export type DocumentProcessorConfig = {
+  chunkSize: number;
+  chunkOverlap: number;
+  ocrTriggerChars: number;
+};
+
 const ZHIPU_SUPPORTED_AUDIO_EXTS = new Set([".wav", ".mp3"]);
 const ZHIPU_DEFAULT_API_BASE = "https://open.bigmodel.cn/api/paas/v4";
 const ZHIPU_DEFAULT_MODEL = "glm-asr-2512";
@@ -68,9 +80,32 @@ export class Qwen3VLProcessor implements IMediaProcessor {
   constructor(
     private readonly baseUrl: string,
     private readonly model: string,
-    private readonly apiKey?: string,
-    private readonly whisperConfig?: WhisperConfig,
+    private readonly apiKey: string | undefined,
+    private readonly whisperConfig: WhisperConfig | undefined,
+    private readonly documentConfig: DocumentProcessorConfig,
+    private readonly ocr: IOcrProvider | undefined,
   ) {}
+
+  /**
+   * 文档处理：解析 → 切分 → 返回 chunks（不做 embedding；embedding 在 watcher 里做）
+   */
+  async processDocument(filePath: string): Promise<DocumentProcessResult> {
+    const ext = extname(filePath).toLowerCase();
+    const segments = await parseDocument({
+      filePath,
+      fileExt: ext,
+      ocrTriggerChars: this.documentConfig.ocrTriggerChars,
+      chunkSize: this.documentConfig.chunkSize,
+      chunkOverlap: this.documentConfig.chunkOverlap,
+      ocr: this.ocr,
+    });
+    const chunks = recursiveChunk(
+      segments,
+      this.documentConfig.chunkSize,
+      this.documentConfig.chunkOverlap,
+    );
+    return { chunks, totalChunks: chunks.length };
+  }
 
   /**
    * 处理图像，返回详细描述
@@ -696,11 +731,15 @@ export function createMediaProcessor(config: {
   ollamaApiKey?: string;
   visionModel: string;
   whisper?: WhisperConfig;
+  document: DocumentProcessorConfig;
+  ocr?: IOcrProvider;
 }): IMediaProcessor {
   return new Qwen3VLProcessor(
     config.ollamaBaseUrl,
     config.visionModel,
     config.ollamaApiKey,
     config.whisper,
+    config.document,
+    config.ocr,
   );
 }

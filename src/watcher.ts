@@ -118,7 +118,11 @@ export class MediaWatcher {
     this.logger.info?.(`Expanded watch paths: ${expandedPaths.join(", ")}`);
 
     // 支持的文件扩展名
-    const supportedExts = [...fileTypes.image, ...fileTypes.audio];
+    const supportedExts = [
+      ...fileTypes.image,
+      ...fileTypes.audio,
+      ...fileTypes.document,
+    ];
 
     this.watcher = chokidar.watch(expandedPaths, {
       // 忽略隐藏文件，但不忽略 watchPaths 本身及其父目录
@@ -248,10 +252,20 @@ export class MediaWatcher {
     this.processNextFile();
   }
 
+  /**
+   * 根据扩展名推断文件类型（image/audio/document），未命中返回 null
+   */
+  private inferFileType(ext: string): MediaType | null {
+    if (this.config.fileTypes.image.includes(ext)) return "image";
+    if (this.config.fileTypes.audio.includes(ext)) return "audio";
+    if (this.config.fileTypes.document.includes(ext)) return "document";
+    return null;
+  }
+
   private async enqueueFileWithBrokenFileGuard(filePath: string): Promise<void> {
     if (await this.shouldSkipBrokenFile(filePath)) {
       const ext = extname(filePath).toLowerCase();
-      const fileType: MediaType = this.config.fileTypes.image.includes(ext) ? "image" : "audio";
+      const fileType: MediaType = this.inferFileType(ext) ?? "image";
       this.callbacks?.onFileSkipped?.(filePath, fileType, "broken");
       this.logger.info?.(`Skipping previously broken file: ${filePath}`);
       return;
@@ -262,7 +276,7 @@ export class MediaWatcher {
   private async handleFileDeleted(filePath: string): Promise<void> {
     this.pruneRecentlyDeletedEntries();
     const ext = extname(filePath).toLowerCase();
-    const fileType: MediaType = this.config.fileTypes.image.includes(ext) ? "image" : "audio";
+    const fileType: MediaType = this.inferFileType(ext) ?? "image";
     const timer = this.debounceTimers.get(filePath);
     if (timer) {
       clearTimeout(timer);
@@ -272,6 +286,20 @@ export class MediaWatcher {
     this.failedFiles.delete(filePath);
     if (removedFromQueue) {
       this.callbacks?.onFileSkipped?.(filePath, fileType, "deleted");
+    }
+
+    if (fileType === "document") {
+      // 文档分支：直接删除 doc_chunks 里该路径的所有 chunks（不做 move-reuse）
+      const removed = await this.storage.deleteDocChunksByPath(filePath);
+      await this.clearBrokenFileMark(filePath);
+      if (removed > 0) {
+        this.logger.info?.(
+          `Removed doc chunks for deleted file: ${filePath}`,
+        );
+      } else {
+        this.logger.info?.(`Deleted document not found in index: ${filePath}`);
+      }
+      return;
     }
 
     const indexedEntry = await this.storage.findByPath(filePath);
@@ -372,7 +400,7 @@ export class MediaWatcher {
 
   private async findMovedSourceByHash(
     fileHash: string,
-    fileType: MediaType,
+    fileType: Extract<MediaType, "image" | "audio">,
   ): Promise<MovedSourceCandidate | null> {
     this.pruneRecentlyDeletedEntries();
 
@@ -417,6 +445,13 @@ export class MediaWatcher {
     if (fileType === "image") {
       return true;
     }
+    if (fileType === "document") {
+      // OCR 启用（默认复用 visionModel）或 embedding 走 ollama 时都需要 ollama
+      return (
+        this.config.document.ocrEnabled ||
+        this.config.embedding.provider === "ollama"
+      );
+    }
     return this.config.embedding.provider === "ollama";
   }
 
@@ -457,7 +492,7 @@ export class MediaWatcher {
   private async reuseMovedEntryWithoutReindex(params: {
     filePath: string;
     fileName: string;
-    fileType: MediaType;
+    fileType: Extract<MediaType, "image" | "audio">;
     fileHash: string;
     stats: FileStatSnapshot;
     mediaCreatedAt: number;
@@ -513,11 +548,8 @@ export class MediaWatcher {
 
     try {
       // 判断文件类型
-      if (this.config.fileTypes.image.includes(ext)) {
-        fileType = "image";
-      } else if (this.config.fileTypes.audio.includes(ext)) {
-        fileType = "audio";
-      } else {
+      fileType = this.inferFileType(ext);
+      if (!fileType) {
         return false; // 不支持的类型
       }
 
@@ -567,6 +599,19 @@ export class MediaWatcher {
       const fileBuffer = await readFile(filePath);
       const fileHash = createHash("sha256").update(fileBuffer).digest("hex");
       const mediaCreatedAt = await resolveMediaCreatedAt(filePath, fileType, stats);
+
+      // document 走独立流水线（不共用 media 表的 same-path 检查与 move-reuse）
+      if (fileType === "document") {
+        return await this.indexDocumentFile({
+          filePath,
+          fileName,
+          ext,
+          stats,
+          fileHash,
+          mediaCreatedAt,
+          startedAt,
+        });
+      }
 
       // 检查同路径记录：路径级一致性（不再做全局 hash 去重）
       const existingByPath = await this.storage.findByPath(filePath);
@@ -772,6 +817,113 @@ export class MediaWatcher {
   }
 
   /**
+   * 文档专用索引流水线：解析 → 切分 → embed 每段 → 写入 doc_chunks
+   *
+   * 一期不做 move-reuse（文档搬迁频率低，复杂度不划算）；
+   * 同路径一致性与 broken-file 语义与 media 对齐。
+   */
+  private async indexDocumentFile(params: {
+    filePath: string;
+    fileName: string;
+    ext: string;
+    stats: { size: number; mtimeMs: number; birthtimeMs: number };
+    fileHash: string;
+    mediaCreatedAt: number;
+    startedAt: number;
+  }): Promise<boolean> {
+    const { filePath, fileName, ext, stats, fileHash, mediaCreatedAt, startedAt } = params;
+
+    // 同路径一致性
+    const existingChunks = await this.storage.findDocChunksByPath(filePath);
+    if (existingChunks.length > 0 && existingChunks[0].fileHash === fileHash) {
+      const sample = existingChunks[0];
+      const unchanged =
+        sample.fileSize === stats.size &&
+        sample.fileModifiedAt === stats.mtimeMs;
+      if (unchanged) {
+        this.logger.info?.(`Skipping unchanged document: ${fileName}`);
+        this.failedFiles.delete(filePath);
+        await this.clearBrokenFileMark(filePath);
+        this.callbacks?.onFileSkipped?.(filePath, "document", "unchanged");
+        return true;
+      }
+
+      // hash 未变，仅 size/mtime 变：复用 chunkText+vector，仅更新元数据
+      const reused = existingChunks.map((c) => ({
+        docId: c.docId,
+        filePath,
+        fileName,
+        fileExt: ext,
+        chunkIndex: c.chunkIndex,
+        totalChunks: c.totalChunks,
+        pageNumber: c.pageNumber,
+        heading: c.heading,
+        chunkText: c.chunkText,
+        vector: c.vector,
+        fileHash,
+        fileSize: stats.size,
+        fileCreatedAt: mediaCreatedAt,
+        fileModifiedAt: stats.mtimeMs,
+      }));
+      await this.storage.replaceDocChunksByPath(filePath, reused);
+      this.logger.info?.(`Updated document metadata without reprocessing: ${fileName}`);
+      this.failedFiles.delete(filePath);
+      await this.clearBrokenFileMark(filePath);
+      this.callbacks?.onFileSkipped?.(filePath, "document", "metadata-updated");
+      return true;
+    }
+
+    // 重新解析 + 切分
+    const result = await this.processor.processDocument(filePath);
+    if (result.chunks.length === 0) {
+      throw new Error(
+        "Document parse produced no chunks (empty content, DRM-protected, or unsupported layout)",
+      );
+    }
+
+    // 对每个 chunk 单独 embed（串行以尊重 embedding 服务的并发限制）
+    const vectors: number[][] = [];
+    for (const chunk of result.chunks) {
+      const vec = await this.embeddings.embed(chunk.chunkText);
+      vectors.push(vec);
+    }
+
+    const chunkInputs = result.chunks.map((chunk, i) => ({
+      docId: fileHash,
+      filePath,
+      fileName,
+      fileExt: ext,
+      chunkIndex: chunk.chunkIndex,
+      totalChunks: result.totalChunks,
+      pageNumber: chunk.pageNumber,
+      heading: chunk.heading,
+      chunkText: chunk.chunkText,
+      vector: vectors[i],
+      fileHash,
+      fileSize: stats.size,
+      fileCreatedAt: mediaCreatedAt,
+      fileModifiedAt: stats.mtimeMs,
+    }));
+
+    await this.storage.replaceDocChunksByPath(filePath, chunkInputs);
+
+    this.logger.info?.(
+      `Indexed document: ${fileName} (${result.totalChunks} chunk${result.totalChunks > 1 ? "s" : ""})`,
+    );
+    this.logEvent("info", "index_file_success", {
+      filePath,
+      fileType: "document",
+      stage: "stored",
+      durationMs: Date.now() - startedAt,
+      totalChunks: result.totalChunks,
+    });
+    this.failedFiles.delete(filePath);
+    await this.clearBrokenFileMark(filePath);
+    this.callbacks?.onFileIndexed(filePath, "document");
+    return true;
+  }
+
+  /**
    * 扫描目录并索引缺失的文件（优化版：批量查询）
    */
   private async scanAndIndexMissingFiles(
@@ -797,12 +949,19 @@ export class MediaWatcher {
     }
 
     // 批量获取所有已索引文件路径（性能优化：一次查询）
-    const indexedFiles = await this.storage.listAllEntries();
-    const indexedPathsSet = new Set(indexedFiles.map((f) => f.filePath));
+    const [indexedFiles, indexedDocPaths] = await Promise.all([
+      this.storage.listAllEntries(),
+      this.storage.listIndexedDocPaths(),
+    ]);
+    const allIndexedPaths = [
+      ...indexedFiles.map((f) => f.filePath),
+      ...indexedDocPaths,
+    ];
+    const indexedPathsSet = new Set(allIndexedPaths);
 
     // 用 realpath 归一化，避免因为软链/路径别名导致“已索引文件被误判为缺失”
     const normalizedIndexedPaths = await Promise.all(
-      indexedFiles.map(async (file) => await this.normalizeComparablePath(file.filePath)),
+      allIndexedPaths.map(async (p) => await this.normalizeComparablePath(p)),
     );
     for (const normalized of normalizedIndexedPaths) {
       indexedPathsSet.add(normalized);
@@ -985,7 +1144,11 @@ export class MediaWatcher {
     // 重新扫描所有文件
     const { watchPaths, fileTypes } = this.config;
     const expandedPaths = watchPaths.map(expandPath);
-    const supportedExts = [...fileTypes.image, ...fileTypes.audio];
+    const supportedExts = [
+      ...fileTypes.image,
+      ...fileTypes.audio,
+      ...fileTypes.document,
+    ];
 
     await this.scanAndIndexMissingFiles(expandedPaths, supportedExts);
   }
@@ -994,20 +1157,26 @@ export class MediaWatcher {
     scanned: number;
     missing: number;
     removed: number;
+    docs: { scanned: number; missingPaths: number; removedChunks: number };
   }> {
     const startedAt = Date.now();
-    const result = await this.storage.cleanupMissingEntries({
-      limit,
-      dryRun: false,
-    });
+    const [mediaResult, docResult] = await Promise.all([
+      this.storage.cleanupMissingEntries({ limit, dryRun: false }),
+      this.storage.cleanupMissingDocChunks({ dryRun: false }),
+    ]);
     const durationMs = Date.now() - startedAt;
     this.logger.info?.(
-      `Cleanup missing indexed files completed: scanned=${result.scanned}, missing=${result.missing}, removed=${result.removed}, durationMs=${durationMs}`,
+      `Cleanup missing indexed files completed: media(scanned=${mediaResult.scanned}, missing=${mediaResult.missing}, removed=${mediaResult.removed}), docs(scanned=${docResult.scanned}, missingPaths=${docResult.missingPaths}, removedChunks=${docResult.removedChunks}), durationMs=${durationMs}`,
     );
     return {
-      scanned: result.scanned,
-      missing: result.missing,
-      removed: result.removed,
+      scanned: mediaResult.scanned,
+      missing: mediaResult.missing,
+      removed: mediaResult.removed,
+      docs: {
+        scanned: docResult.scanned,
+        missingPaths: docResult.missingPaths,
+        removedChunks: docResult.removedChunks,
+      },
     };
   }
 

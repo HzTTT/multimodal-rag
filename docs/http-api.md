@@ -198,3 +198,28 @@ HTTP 404
 ### 5.3 `desc` 异步生成
 
 图像 AI 描述与音频 ASR 都是**异步在 watcher 里跑**，不由 HTTP 接口触发。批量上传大量文件时，建议先等索引跑完再轮询 `/get_file_info`，否则大部分响应会是 `"(indexing)"`。
+
+---
+
+## 6. 文档（document）支持
+
+与 image/audio 并列，`.pdf / .docx / .xlsx / .pptx / .txt / .md / .markdown / .html / .htm` 走文档路径。
+
+### 6.1 `POST /get_file_info` 对 document 的差异
+
+- `kind: "document"`；`contentType` 按扩展名映射（例如 `.pdf → application/pdf`，`.docx → application/vnd.openxmlformats-officedocument.wordprocessingml.document`）。
+- `desc` 取自 `storage.findDocChunksByPath` 的前 3 段 chunkText 拼接（上限 1200 字，超出截断加 `…`）。
+- `location` 永远为空（文档不抽 EXIF GPS）。
+- 未索引时同样返回 `"(indexing)"`；启用 `--enable-index-on-demand` 时 fire-and-forget 触发 `watcher.indexPath`。
+
+### 6.2 `GET /search_file` 对 document 的差异
+
+- 底层改用 `storage.unifiedSearch`，同时查 media 与 doc_chunks 两张表，文档侧先按 `docId` 聚合再合并。
+- 响应仍是**去重后的文件绝对路径数组**，同一文档多段命中只会出现一次。
+- `--search-min-score` 对两张表同时生效。
+
+### 6.3 依赖
+
+- `pdftoppm`（poppler）仅在 PDF 扫描页 OCR 回落时需要；纯文本 PDF 不依赖。
+- Ollama VLM（`ocrModel` 或 `visionModel` fallback）在 OCR 开启时需要可用。
+- `officeparser` / `pdfjs-dist` 是插件 npm 依赖，随 `npm install` 到位。

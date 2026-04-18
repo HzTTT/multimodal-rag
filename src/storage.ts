@@ -1,15 +1,28 @@
 /**
- * LanceDB 向量存储实现
+ * LanceDB 向量存储实现（双表：media + doc_chunks）
  */
 
 import * as lancedb from "@lancedb/lancedb";
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
-import type { MediaEntry, MediaSearchResult, MediaType } from "./types.js";
+import type {
+  DocChunkEntry,
+  DocChunkSearchResult,
+  DocSummary,
+  MediaEntry,
+  MediaSearchResult,
+  MediaType,
+  UnifiedSearchResult,
+} from "./types.js";
 
 const TABLE_NAME = "media";
+const DOC_CHUNKS_TABLE = "doc_chunks";
 const SCALAR_FILTER_INDICES = [
   { column: "fileType", factory: () => lancedb.Index.bitmap() },
+  { column: "fileCreatedAt", factory: () => lancedb.Index.btree() },
+] as const;
+const DOC_CHUNKS_SCALAR_INDICES = [
+  { column: "fileExt", factory: () => lancedb.Index.bitmap() },
   { column: "fileCreatedAt", factory: () => lancedb.Index.btree() },
 ] as const;
 const DEFAULT_AUTO_OPTIMIZE_THRESHOLD = 20;
@@ -32,11 +45,19 @@ type MediaStorageOptions = {
  */
 export type SearchOptions = {
   type?: MediaType | "all";
-  after?: number; // Unix timestamp (ms)
-  before?: number; // Unix timestamp (ms)
+  after?: number;
+  before?: number;
   limit?: number;
   minScore?: number;
   dedupeByHash?: boolean;
+};
+
+export type DocSearchOptions = {
+  after?: number;
+  before?: number;
+  limit?: number;
+  minScore?: number;
+  fileExt?: string;
 };
 
 export type CleanupMissingOptions = {
@@ -52,14 +73,23 @@ export type CleanupMissingResult = {
   missingIds: string[];
 };
 
+export type CleanupMissingDocsResult = {
+  scanned: number;
+  missingPaths: number;
+  removedChunks: number;
+  missingFilePaths: string[];
+};
+
 /**
- * LanceDB 媒体存储
+ * LanceDB 媒体存储（同时管理 media 和 doc_chunks 两张表）
  */
 export class MediaStorage {
   private db: lancedb.Connection | null = null;
   private table: lancedb.Table | null = null;
+  private docTable: lancedb.Table | null = null;
   private initPromise: Promise<void> | null = null;
   private scalarIndicesReady = false;
+  private docScalarIndicesReady = false;
   private autoOptimizeTimer: NodeJS.Timeout | null = null;
   private autoOptimizeRunning = false;
   private autoOptimizeDirtyOperations = 0;
@@ -72,7 +102,7 @@ export class MediaStorage {
   ) {}
 
   private async ensureInitialized(): Promise<void> {
-    if (this.table) {
+    if (this.table && this.docTable) {
       return;
     }
     if (this.initPromise) {
@@ -84,18 +114,14 @@ export class MediaStorage {
   }
 
   /**
-   * 刷新表到最新版本
-   * LanceDB 的表在 openTable() 后会保持在当时的版本，
-   * 需要调用 checkoutLatest() 来刷新到最新数据。
-   * 这对于多实例场景（不同渠道可能使用不同的插件实例）非常重要。
+   * 刷新两张表到最新版本
    */
   private async refreshToLatest(): Promise<void> {
-    if (this.table) {
+    for (const tbl of [this.table, this.docTable]) {
+      if (!tbl) continue;
       try {
-        await this.table.checkoutLatest();
+        await tbl.checkoutLatest();
       } catch (error) {
-        // 忽略 checkoutLatest 错误（可能是表从未进入 time-travel 模式）
-        // LanceDB 0.11+ 可能不需要显式调用此方法
         console.debug?.(`[multimodal-rag] checkoutLatest skipped: ${String(error)}`);
       }
     }
@@ -108,7 +134,6 @@ export class MediaStorage {
     if (tables.includes(TABLE_NAME)) {
       this.table = await this.db.openTable(TABLE_NAME);
     } else {
-      // 创建表并定义 schema
       this.table = await this.db.createTable(TABLE_NAME, [
         {
           id: "__schema__",
@@ -124,11 +149,37 @@ export class MediaStorage {
           indexedAt: 0,
         } as MediaEntry,
       ]);
-      // 删除 schema 占位行
       await this.table.delete('id = "__schema__"');
     }
 
+    if (tables.includes(DOC_CHUNKS_TABLE)) {
+      this.docTable = await this.db.openTable(DOC_CHUNKS_TABLE);
+    } else {
+      this.docTable = await this.db.createTable(DOC_CHUNKS_TABLE, [
+        {
+          id: "__schema__",
+          docId: "",
+          filePath: "",
+          fileName: "",
+          fileExt: "",
+          chunkIndex: 0,
+          totalChunks: 0,
+          pageNumber: 0,
+          heading: "",
+          chunkText: "",
+          vector: Array.from({ length: this.vectorDim }).fill(0),
+          fileHash: "",
+          fileSize: 0,
+          fileCreatedAt: 0,
+          fileModifiedAt: 0,
+          indexedAt: 0,
+        } as DocChunkEntry,
+      ]);
+      await this.docTable.delete('id = "__schema__"');
+    }
+
     await this.ensureScalarFilterIndices();
+    await this.ensureDocScalarFilterIndices();
   }
 
   private async ensureScalarFilterIndices(): Promise<void> {
@@ -161,6 +212,41 @@ export class MediaStorage {
       this.scalarIndicesReady = true;
     } catch (error) {
       console.warn(`[multimodal-rag] ensureScalarFilterIndices failed: ${String(error)}`);
+    }
+  }
+
+  private async ensureDocScalarFilterIndices(): Promise<void> {
+    if (!this.docTable || this.docScalarIndicesReady) {
+      return;
+    }
+
+    try {
+      const totalRows = await this.docTable.countRows();
+      if (totalRows === 0) {
+        return;
+      }
+
+      const existingIndices = await this.docTable.listIndices();
+      const indexedColumns = new Set(
+        existingIndices.flatMap((index) => index.columns.map((column) => String(column))),
+      );
+
+      for (const spec of DOC_CHUNKS_SCALAR_INDICES) {
+        if (indexedColumns.has(spec.column)) {
+          continue;
+        }
+
+        await this.docTable.createIndex(spec.column, {
+          config: spec.factory(),
+          replace: false,
+        });
+      }
+
+      this.docScalarIndicesReady = true;
+    } catch (error) {
+      console.warn(
+        `[multimodal-rag] ensureDocScalarFilterIndices failed: ${String(error)}`,
+      );
     }
   }
 
@@ -208,7 +294,12 @@ export class MediaStorage {
   }
 
   private async runAutoOptimize(): Promise<void> {
-    if (!this.table || this.autoOptimizeRunning || this.autoOptimizeDirtyOperations === 0) {
+    if (
+      !this.table ||
+      !this.docTable ||
+      this.autoOptimizeRunning ||
+      this.autoOptimizeDirtyOperations === 0
+    ) {
       return;
     }
 
@@ -219,10 +310,11 @@ export class MediaStorage {
 
     try {
       await this.refreshToLatest();
-      const stats = await this.table.optimize();
+      const mediaStats = await this.table.optimize();
+      const docStats = await this.docTable.optimize();
       await this.refreshToLatest();
       console.info?.(
-        `[multimodal-rag] auto optimize completed after ${dirtyOperations} modification(s): ${JSON.stringify(stats)}`,
+        `[multimodal-rag] auto optimize completed after ${dirtyOperations} modification(s): media=${JSON.stringify(mediaStats)} doc=${JSON.stringify(docStats)}`,
       );
     } catch (error) {
       console.warn(`[multimodal-rag] auto optimize failed: ${String(error)}`);
@@ -234,6 +326,10 @@ export class MediaStorage {
       }
     }
   }
+
+  // ============================================================
+  // media 表 API（image/audio）
+  // ============================================================
 
   /**
    * 存储媒体条目
@@ -271,7 +367,6 @@ export class MediaStorage {
     options: SearchOptions = {},
   ): Promise<MediaSearchResult[]> {
     await this.ensureInitialized();
-    // 刷新到最新版本，确保跨渠道数据一致性
     await this.refreshToLatest();
 
     const {
@@ -283,11 +378,14 @@ export class MediaStorage {
       dedupeByHash = true,
     } = options;
 
-    // 构建查询
-    const candidateLimit = Math.max(limit * (dedupeByHash ? 8 : 2), limit);
-    let query = this.table!.vectorSearch(vector).limit(candidateLimit); // 多获取一些，过滤后可能不够
+    // document 类型走 doc_chunks 表，不在此方法返回
+    if (type === "document") {
+      return [];
+    }
 
-    // 时间过滤（LanceDB 字段名需要反引号包裹，大小写敏感）
+    const candidateLimit = Math.max(limit * (dedupeByHash ? 8 : 2), limit);
+    let query = this.table!.vectorSearch(vector).limit(candidateLimit);
+
     if (after || before || type !== "all") {
       const conditions: string[] = [];
 
@@ -310,17 +408,15 @@ export class MediaStorage {
 
     const results = await query.toArray();
 
-    // LanceDB 使用 L2 距离，转换为相似度分数
     const mapped = results.map((row) => {
       const distance = row._distance ?? 0;
-      // 转换: score = 1 / (1 + distance)
       const score = 1 / (1 + distance);
       return {
         entry: {
           id: row.id as string,
           filePath: row.filePath as string,
           fileName: row.fileName as string,
-          fileType: row.fileType as MediaType,
+          fileType: row.fileType as Extract<MediaType, "image" | "audio">,
           description: row.description as string,
           fileHash: row.fileHash as string,
           fileSize: row.fileSize as number,
@@ -332,10 +428,8 @@ export class MediaStorage {
       };
     });
 
-    // 过滤低分结果
     const filtered = mapped.filter((r) => r.score >= minScore);
 
-    // 默认按内容 hash 去重展示：只保留每个 hash 的首条（分数最高）
     if (!dedupeByHash) {
       return filtered.slice(0, limit);
     }
@@ -357,9 +451,6 @@ export class MediaStorage {
     return deduped;
   }
 
-  /**
-   * 将行数据转换为完整 MediaEntry（含 vector）
-   */
   private rowToFullEntry(row: any): MediaEntry {
     return {
       ...this.rowToEntry(row),
@@ -369,13 +460,11 @@ export class MediaStorage {
 
   /**
    * 通过文件路径查找
-   * 先尝试 where() 查询（快速路径），失败或无结果时回退到全量扫描
    */
   async findByPath(filePath: string): Promise<MediaEntry | null> {
     await this.ensureInitialized();
     await this.refreshToLatest();
 
-    // 快速路径：where 查询
     try {
       const results = await this.table!
         .query()
@@ -390,24 +479,16 @@ export class MediaStorage {
       // where 查询失败，回退到全量扫描
     }
 
-    // 回退：全量扫描（处理 LanceDB fragment 不一致问题）
     const allRows = await this.getAllRows();
     const row = allRows.find((r) => r.filePath === filePath);
     return row ? this.rowToFullEntry(row) : null;
   }
 
-  /**
-   * 通过 hash 查找（返回首条）
-   */
   async findByHash(fileHash: string): Promise<MediaEntry | null> {
     const matches = await this.findEntriesByHash(fileHash, 1);
     return matches[0] ?? null;
   }
 
-  /**
-   * 通过 hash 查找全部候选条目
-   * 先尝试 where() 查询（快速路径），失败或无结果时回退到全量扫描
-   */
   async findEntriesByHash(fileHash: string, limit = 1000): Promise<MediaEntry[]> {
     await this.ensureInitialized();
     await this.refreshToLatest();
@@ -418,7 +499,6 @@ export class MediaStorage {
         ? Math.floor(limit)
         : 1000;
 
-    // 快速路径：where 查询
     try {
       const results = await this.table!
         .query()
@@ -433,7 +513,6 @@ export class MediaStorage {
       // where 查询失败，回退到全量扫描
     }
 
-    // 回退：全量扫描（处理 LanceDB fragment 不一致问题）
     const allRows = await this.getAllRows();
     const filtered = allRows
       .filter((row) => row.fileHash === fileHash)
@@ -442,13 +521,9 @@ export class MediaStorage {
     return filtered;
   }
 
-  /**
-   * 删除条目
-   */
   async delete(id: string): Promise<boolean> {
     await this.ensureInitialized();
 
-    // UUID 格式验证（防注入）
     const uuidRegex =
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!uuidRegex.test(id)) {
@@ -460,9 +535,6 @@ export class MediaStorage {
     return true;
   }
 
-  /**
-   * 按路径删除条目
-   */
   async deleteByPath(filePath: string): Promise<number> {
     await this.ensureInitialized();
     await this.refreshToLatest();
@@ -485,19 +557,11 @@ export class MediaStorage {
     return removed;
   }
 
-  /**
-   * 获取所有行（不使用 where 过滤，避免 LanceDB 查询 bug）
-   *
-   * 重要: LanceDB query().toArray() 有一个隐含的默认 limit（约 10 行），
-   * 必须显式调用 .limit() 才能获取全部数据。这里使用 countRows() 获取
-   * 准确行数，然后传给 limit() 确保一次性取回所有行。
-   */
   private async getAllRows(): Promise<any[]> {
     await this.ensureInitialized();
     await this.refreshToLatest();
 
     try {
-      // 先获取准确行数，再用 limit 取全部
       const totalRows = await this.table!.countRows();
       if (totalRows === 0) {
         return [];
@@ -530,23 +594,17 @@ export class MediaStorage {
       .map((row) => this.rowToFullEntry(row));
   }
 
-  /**
-   * 列出全部条目（不分页）
-   */
   async listAllEntries(): Promise<Omit<MediaEntry, "vector">[]> {
     const rows = await this.getAllRows();
     return rows.map((row) => this.rowToEntry(row));
   }
 
-  /**
-   * 将行数据转换为 MediaEntry（不含 vector）
-   */
   private rowToEntry(row: any): Omit<MediaEntry, "vector"> {
     return {
       id: row.id as string,
       filePath: row.filePath as string,
       fileName: row.fileName as string,
-      fileType: row.fileType as MediaType,
+      fileType: row.fileType as Extract<MediaType, "image" | "audio">,
       description: row.description as string,
       fileHash: row.fileHash as string,
       fileSize: row.fileSize as number,
@@ -556,33 +614,27 @@ export class MediaStorage {
     };
   }
 
-  /**
-   * 列出所有条目（支持分页和过滤）
-   */
-  async list(options: {
-    type?: MediaType | "all";
-    after?: number;
-    before?: number;
-    limit?: number;
-    offset?: number;
-  } = {}): Promise<{ total: number; entries: Omit<MediaEntry, "vector">[] }> {
-    const {
-      type = "all",
-      after,
-      before,
-      limit = 20,
-      offset = 0,
-    } = options;
+  async list(
+    options: {
+      type?: MediaType | "all";
+      after?: number;
+      before?: number;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ): Promise<{ total: number; entries: Omit<MediaEntry, "vector">[] }> {
+    const { type = "all", after, before, limit = 20, offset = 0 } = options;
 
-    // 获取所有行（不用 where，避免 LanceDB fragment 不一致 bug）
+    if (type === "document") {
+      return { total: 0, entries: [] };
+    }
+
     let allResults = await this.getAllRows();
 
-    // 内存中按类型过滤
     if (type !== "all") {
       allResults = allResults.filter((r) => r.fileType === type);
     }
 
-    // 内存中按时间过滤
     if (after || before) {
       allResults = allResults.filter((r) => {
         const ts = r.fileCreatedAt;
@@ -592,26 +644,22 @@ export class MediaStorage {
       });
     }
 
-    // 按时间倒序排序（最新在前）
     allResults.sort((a, b) => (b.fileCreatedAt as number) - (a.fileCreatedAt as number));
 
     const total = allResults.length;
-
-    // 分页
     const paged = allResults.slice(offset, offset + limit);
-
     const entries = paged.map((row) => this.rowToEntry(row));
 
     return { total, entries };
   }
 
-  /**
-   * 统计信息（使用全量扫描，确保和 list() 结果一致）
-   */
   async count(type?: MediaType | "all"): Promise<number> {
     const allRows = await this.getAllRows();
     if (!type || type === "all") {
       return allRows.length;
+    }
+    if (type === "document") {
+      return 0;
     }
     return allRows.filter((r) => r.fileType === type).length;
   }
@@ -620,9 +668,6 @@ export class MediaStorage {
     return FAILED_MEDIA_DESCRIPTION_PATTERNS.some((pattern) => pattern.test(description));
   }
 
-  /**
-   * 清理历史版本写入的失败媒体脏数据（音频/图片）
-   */
   async cleanupFailedMediaEntries(): Promise<{ removed: number; candidates: number }> {
     await this.ensureInitialized();
     await this.refreshToLatest();
@@ -658,9 +703,6 @@ export class MediaStorage {
     return this.cleanupFailedMediaEntries();
   }
 
-  /**
-   * 清理“索引存在但原文件已丢失”的条目
-   */
   async cleanupMissingEntries(
     options: CleanupMissingOptions = {},
   ): Promise<CleanupMissingResult> {
@@ -743,12 +785,547 @@ export class MediaStorage {
     }
   }
 
-  /**
-   * 清空所有数据
-   */
   async clear(): Promise<void> {
     await this.ensureInitialized();
     await this.table!.delete("id IS NOT NULL");
+    await this.docTable!.delete("id IS NOT NULL");
     this.markAutoOptimizeDirty();
   }
+
+  // ============================================================
+  // doc_chunks 表 API（document）
+  // ============================================================
+
+  /**
+   * 批量存储文档 chunks
+   */
+  async storeDocChunks(
+    chunks: Array<Omit<DocChunkEntry, "id" | "indexedAt">>,
+  ): Promise<DocChunkEntry[]> {
+    await this.ensureInitialized();
+
+    if (chunks.length === 0) {
+      return [];
+    }
+
+    const now = Date.now();
+    const fullChunks: DocChunkEntry[] = chunks.map((chunk) => ({
+      ...chunk,
+      id: randomUUID(),
+      indexedAt: now,
+    }));
+
+    await this.docTable!.add(fullChunks);
+    await this.ensureDocScalarFilterIndices();
+    this.markAutoOptimizeDirty();
+    return fullChunks;
+  }
+
+  /**
+   * 按文件路径替换文档 chunks（先删光旧的，再插入新的）
+   */
+  async replaceDocChunksByPath(
+    filePath: string,
+    chunks: Array<Omit<DocChunkEntry, "id" | "indexedAt">>,
+  ): Promise<DocChunkEntry[]> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+    await this.deleteDocChunksByPath(filePath);
+    return this.storeDocChunks(chunks);
+  }
+
+  /**
+   * 查找某文件路径下的所有 chunks（按 chunkIndex 升序）
+   */
+  async findDocChunksByPath(filePath: string): Promise<DocChunkEntry[]> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    try {
+      const results = await this.docTable!
+        .query()
+        .where("`filePath` = '" + filePath.replace(/'/g, "''") + "'")
+        .limit(10000)
+        .toArray();
+      if (Array.isArray(results) && results.length > 0) {
+        return results
+          .map((row) => this.rowToFullDocChunk(row))
+          .sort((a, b) => a.chunkIndex - b.chunkIndex);
+      }
+    } catch {
+      // where 查询失败，回退到全量扫描
+    }
+
+    const allRows = await this.getAllDocChunkRows();
+    return allRows
+      .filter((r) => r.filePath === filePath)
+      .map((row) => this.rowToFullDocChunk(row))
+      .sort((a, b) => a.chunkIndex - b.chunkIndex);
+  }
+
+  /**
+   * 按 hash 查找文档 chunks（只返回 path 存在的第一份文件的全量 chunks）
+   */
+  async findDocChunksByHash(
+    fileHash: string,
+    limit = 10000,
+  ): Promise<DocChunkEntry[]> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    const escaped = fileHash.replace(/'/g, "''");
+    const safeLimit =
+      typeof limit === "number" && Number.isFinite(limit) && limit > 0
+        ? Math.floor(limit)
+        : 10000;
+
+    try {
+      const results = await this.docTable!
+        .query()
+        .where("`fileHash` = '" + escaped + "'")
+        .limit(safeLimit)
+        .toArray();
+      if (Array.isArray(results) && results.length > 0) {
+        return results.map((row) => this.rowToFullDocChunk(row));
+      }
+    } catch {
+      // where 查询失败，回退到全量扫描
+    }
+
+    const allRows = await this.getAllDocChunkRows();
+    return allRows
+      .filter((r) => r.fileHash === fileHash)
+      .slice(0, safeLimit)
+      .map((row) => this.rowToFullDocChunk(row));
+  }
+
+  /**
+   * 按路径删除所有 chunks
+   */
+  async deleteDocChunksByPath(filePath: string): Promise<number> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    const escaped = filePath.replace(/'/g, "''");
+    try {
+      await this.docTable!.delete(`\`filePath\` = '${escaped}'`);
+      this.markAutoOptimizeDirty();
+      // 无法直接拿到删除数量（LanceDB delete 不返回 count），返回近似值
+      return 1;
+    } catch {
+      // 回退：逐行删
+      const matches = await this.findDocChunksByPath(filePath);
+      let removed = 0;
+      for (const chunk of matches) {
+        try {
+          await this.docTable!.delete(`id = '${chunk.id}'`);
+          removed++;
+        } catch {
+          // 忽略
+        }
+      }
+      if (removed > 0) {
+        this.markAutoOptimizeDirty();
+      }
+      return removed;
+    }
+  }
+
+  /**
+   * 在 doc_chunks 里做向量搜索
+   */
+  async searchDocChunks(
+    vector: number[],
+    options: DocSearchOptions = {},
+  ): Promise<DocChunkSearchResult[]> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    const { after, before, limit = 5, minScore = 0.25, fileExt } = options;
+
+    const candidateLimit = Math.max(limit * 4, 20);
+    let query = this.docTable!.vectorSearch(vector).limit(candidateLimit);
+
+    const conditions: string[] = [];
+    if (fileExt) {
+      conditions.push("`fileExt` = '" + fileExt.replace(/'/g, "''") + "'");
+    }
+    if (after) {
+      conditions.push("`fileCreatedAt` >= " + after);
+    }
+    if (before) {
+      conditions.push("`fileCreatedAt` <= " + before);
+    }
+    if (conditions.length > 0) {
+      query = query.where(conditions.join(" AND "));
+    }
+
+    const results = await query.toArray();
+
+    const mapped: DocChunkSearchResult[] = results.map((row) => {
+      const distance = row._distance ?? 0;
+      const score = 1 / (1 + distance);
+      return {
+        chunk: this.rowToDocChunk(row),
+        score,
+      };
+    });
+
+    return mapped.filter((r) => r.score >= minScore).slice(0, limit);
+  }
+
+  /**
+   * 按 docId(=fileHash) 聚合 chunk 搜索结果 → 每文件一条 + snippet
+   */
+  async searchDocsAggregated(
+    vector: number[],
+    options: DocSearchOptions & { snippetMaxChars?: number } = {},
+  ): Promise<Array<{ doc: DocSummary; bestChunk: Omit<DocChunkEntry, "vector">; score: number }>> {
+    const { snippetMaxChars = 120, ...rest } = options;
+    // 多取一些 chunk，聚合后可能不够
+    const limit = rest.limit ?? 5;
+    const chunkResults = await this.searchDocChunks(vector, {
+      ...rest,
+      limit: Math.max(limit * 4, 20),
+    });
+
+    // 按 docId 聚合，保留最高分
+    const bestByDoc = new Map<string, DocChunkSearchResult>();
+    for (const item of chunkResults) {
+      const docId = item.chunk.docId;
+      const existing = bestByDoc.get(docId);
+      if (!existing || item.score > existing.score) {
+        bestByDoc.set(docId, item);
+      }
+    }
+
+    const aggregated = [...bestByDoc.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+
+    return aggregated.map((item) => {
+      const chunk = item.chunk;
+      const snippet = makeSnippet(chunk.chunkText, snippetMaxChars);
+      const summary: DocSummary = {
+        docId: chunk.docId,
+        filePath: chunk.filePath,
+        fileName: chunk.fileName,
+        fileExt: chunk.fileExt,
+        totalChunks: chunk.totalChunks,
+        fileSize: chunk.fileSize,
+        fileCreatedAt: chunk.fileCreatedAt,
+        fileModifiedAt: chunk.fileModifiedAt,
+        indexedAt: chunk.indexedAt,
+        snippet,
+        topPageNumber: chunk.pageNumber,
+        topHeading: chunk.heading,
+      };
+      return { doc: summary, bestChunk: chunk, score: item.score };
+    });
+  }
+
+  /**
+   * 列出所有文档（按 docId/filePath 聚合）
+   */
+  async listDocSummaries(
+    options: {
+      after?: number;
+      before?: number;
+      limit?: number;
+      offset?: number;
+      fileExt?: string;
+    } = {},
+  ): Promise<{ total: number; docs: DocSummary[] }> {
+    const { after, before, limit = 20, offset = 0, fileExt } = options;
+
+    let rows = await this.getAllDocChunkRows();
+
+    if (fileExt) {
+      rows = rows.filter((r) => r.fileExt === fileExt);
+    }
+    if (after) {
+      rows = rows.filter((r) => (r.fileCreatedAt as number) >= after);
+    }
+    if (before) {
+      rows = rows.filter((r) => (r.fileCreatedAt as number) <= before);
+    }
+
+    // 按 filePath 分组，每组取 chunkIndex=0 或第 1 段作为 snippet
+    const groups = new Map<string, any[]>();
+    for (const row of rows) {
+      const key = String(row.filePath ?? "");
+      if (!key) continue;
+      const bucket = groups.get(key) ?? [];
+      bucket.push(row);
+      groups.set(key, bucket);
+    }
+
+    const docs: DocSummary[] = [];
+    for (const [filePath, bucket] of groups.entries()) {
+      bucket.sort((a, b) => (a.chunkIndex as number) - (b.chunkIndex as number));
+      const first = bucket[0];
+      const summary: DocSummary = {
+        docId: String(first.docId ?? ""),
+        filePath,
+        fileName: String(first.fileName ?? ""),
+        fileExt: String(first.fileExt ?? ""),
+        totalChunks: Number(first.totalChunks ?? bucket.length),
+        fileSize: Number(first.fileSize ?? 0),
+        fileCreatedAt: Number(first.fileCreatedAt ?? 0),
+        fileModifiedAt: Number(first.fileModifiedAt ?? 0),
+        indexedAt: Number(first.indexedAt ?? 0),
+        snippet: makeSnippet(String(first.chunkText ?? ""), 120),
+        topPageNumber: Number(first.pageNumber ?? 0),
+        topHeading: String(first.heading ?? ""),
+      };
+      docs.push(summary);
+    }
+
+    docs.sort((a, b) => b.fileCreatedAt - a.fileCreatedAt);
+
+    const total = docs.length;
+    const paged = docs.slice(offset, offset + limit);
+    return { total, docs: paged };
+  }
+
+  /**
+   * 文档文件数（去重按 filePath）
+   */
+  async countDocs(): Promise<number> {
+    const paths = await this.listIndexedDocPaths();
+    return paths.length;
+  }
+
+  /**
+   * 列出 doc_chunks 表里所有唯一的文件路径（供启动扫描比对使用）
+   */
+  async listIndexedDocPaths(): Promise<string[]> {
+    const rows = await this.getAllDocChunkRows();
+    const paths = new Set<string>();
+    for (const row of rows) {
+      const p = String(row.filePath ?? "");
+      if (p) paths.add(p);
+    }
+    return [...paths];
+  }
+
+  /**
+   * chunk 总条数
+   */
+  async countDocChunks(): Promise<number> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+    try {
+      return await this.docTable!.countRows();
+    } catch {
+      const rows = await this.getAllDocChunkRows();
+      return rows.length;
+    }
+  }
+
+  /**
+   * 清理"索引存在但源文档文件已丢失"的条目（按 filePath 去重扫描）
+   */
+  async cleanupMissingDocChunks(
+    options: { dryRun?: boolean; candidates?: string[] } = {},
+  ): Promise<CleanupMissingDocsResult> {
+    const startedAt = Date.now();
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    const { dryRun = false, candidates } = options;
+
+    // 候选集合：按 filePath 去重
+    let candidatePaths: string[];
+    if (Array.isArray(candidates) && candidates.length > 0) {
+      candidatePaths = [...new Set(candidates.filter((p) => typeof p === "string" && p))];
+    } else {
+      const rows = await this.getAllDocChunkRows();
+      const set = new Set<string>();
+      for (const row of rows) {
+        const p = String(row.filePath ?? "");
+        if (p) set.add(p);
+      }
+      candidatePaths = [...set];
+    }
+
+    const missingPaths: string[] = [];
+    for (const p of candidatePaths) {
+      if (await this.isPathMissing(p)) {
+        missingPaths.push(p);
+      }
+    }
+
+    let removedChunks = 0;
+    if (!dryRun) {
+      for (const p of missingPaths) {
+        const removed = await this.deleteDocChunksByPath(p);
+        removedChunks += removed;
+      }
+    }
+
+    const result = {
+      scanned: candidatePaths.length,
+      missingPaths: missingPaths.length,
+      removedChunks,
+      missingFilePaths: missingPaths,
+    };
+
+    const durationMs = Date.now() - startedAt;
+    console.info(
+      JSON.stringify({
+        event: "cleanup_missing_doc_chunks_completed",
+        scanned: result.scanned,
+        missingPaths: result.missingPaths,
+        removedChunks: result.removedChunks,
+        durationMs,
+        dryRun,
+      }),
+    );
+
+    return result;
+  }
+
+  /**
+   * 列出所有 doc chunk 行（内部）
+   */
+  private async getAllDocChunkRows(): Promise<any[]> {
+    await this.ensureInitialized();
+    await this.refreshToLatest();
+
+    try {
+      const totalRows = await this.docTable!.countRows();
+      if (totalRows === 0) {
+        return [];
+      }
+      const results = await this.docTable!.query().limit(totalRows).toArray();
+      return Array.isArray(results) ? results : [];
+    } catch (error) {
+      console.warn(`[multimodal-rag] getAllDocChunkRows failed: ${String(error)}`);
+      return [];
+    }
+  }
+
+  private rowToFullDocChunk(row: any): DocChunkEntry {
+    return {
+      ...this.rowToDocChunk(row),
+      vector: row.vector as number[],
+    };
+  }
+
+  private rowToDocChunk(row: any): Omit<DocChunkEntry, "vector"> {
+    return {
+      id: row.id as string,
+      docId: row.docId as string,
+      filePath: row.filePath as string,
+      fileName: row.fileName as string,
+      fileExt: row.fileExt as string,
+      chunkIndex: Number(row.chunkIndex ?? 0),
+      totalChunks: Number(row.totalChunks ?? 0),
+      pageNumber: Number(row.pageNumber ?? 0),
+      heading: String(row.heading ?? ""),
+      chunkText: String(row.chunkText ?? ""),
+      fileHash: row.fileHash as string,
+      fileSize: Number(row.fileSize ?? 0),
+      fileCreatedAt: Number(row.fileCreatedAt ?? 0),
+      fileModifiedAt: Number(row.fileModifiedAt ?? 0),
+      indexedAt: Number(row.indexedAt ?? 0),
+    };
+  }
+
+  // ============================================================
+  // 统一聚合 API（供 media_search 工具使用）
+  // ============================================================
+
+  /**
+   * 统一搜索：media + doc_chunks，按 score 合并
+   * 注：调用方已持有一个 query vector
+   */
+  async unifiedSearch(
+    vector: number[],
+    options: {
+      type?: MediaType | "all";
+      after?: number;
+      before?: number;
+      limit?: number;
+      minScore?: number;
+      dedupeByHash?: boolean;
+    } = {},
+  ): Promise<UnifiedSearchResult[]> {
+    const {
+      type = "all",
+      after,
+      before,
+      limit = 5,
+      minScore = 0.25,
+      dedupeByHash = true,
+    } = options;
+
+    const wantMedia = type === "all" || type === "image" || type === "audio";
+    const wantDocs = type === "all" || type === "document";
+
+    const tasks: Promise<unknown>[] = [];
+    let mediaResults: MediaSearchResult[] = [];
+    let docResults: Array<{
+      doc: DocSummary;
+      bestChunk: Omit<DocChunkEntry, "vector">;
+      score: number;
+    }> = [];
+
+    if (wantMedia) {
+      tasks.push(
+        (async () => {
+          mediaResults = await this.search(vector, {
+            // search() 内部对 "document" 会早退返回 []，这里无需三元
+            type,
+            after,
+            before,
+            limit,
+            minScore,
+            dedupeByHash,
+          });
+        })(),
+      );
+    }
+    if (wantDocs) {
+      tasks.push(
+        (async () => {
+          docResults = await this.searchDocsAggregated(vector, {
+            after,
+            before,
+            limit,
+            minScore,
+          });
+        })(),
+      );
+    }
+
+    await Promise.all(tasks);
+
+    const unified: UnifiedSearchResult[] = [
+      ...mediaResults.map<UnifiedSearchResult>((r) => ({
+        kind: "media",
+        entry: r.entry,
+        score: r.score,
+      })),
+      ...docResults.map<UnifiedSearchResult>((r) => ({
+        kind: "document",
+        doc: r.doc,
+        bestChunk: r.bestChunk,
+        score: r.score,
+      })),
+    ];
+
+    unified.sort((a, b) => b.score - a.score);
+    return unified.slice(0, limit);
+  }
+}
+
+/**
+ * 从 chunkText 构造 snippet：优先保留开头，截断时追加省略号
+ */
+function makeSnippet(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return normalized.slice(0, Math.max(0, maxChars - 1)) + "…";
 }

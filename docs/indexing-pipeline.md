@@ -671,3 +671,70 @@ notifier 自己持有的资源（spinner、telegram 句柄等）（参见
   `agent-tools.md`
 - 运维命令（`multimodal-rag index / reindex / cleanup-missing /
   cleanup-failed-media / doctor`）与 broken-file 标记修复：`operations.md`
+
+---
+
+## 13. 文档（document）主链路
+
+`fileTypes.document` 命中的扩展名走独立流水线，最终写入 `doc_chunks` 表（见
+[storage.md §11](./storage.md#11-文档document子表doc_chunks)）。watcher 在
+`indexFile` 内部识别到 `fileType === "document"` 时，在取完 `stat + sha256 +
+mediaCreatedAt` 之后早退到 `indexDocumentFile`（`src/watcher.ts`），跳过 media
+表的 same-path 检查与 move-reuse。
+
+### 13.1 解析 → 切分 → embed → 写入
+
+```mermaid
+flowchart TD
+  Start([indexFile 识别为 document]) --> Pre[stat + sha256 + resolveMediaCreatedAt]
+  Pre --> Branch[indexDocumentFile]
+  Branch --> Same{findDocChunksByPath\n hash 相同?}
+  Same -->|是 + size/mtime 同| Skip[onFileSkipped 'unchanged']
+  Same -->|是 + size/mtime 变| Meta[复用 chunkText/vector<br/>replaceDocChunksByPath]
+  Meta --> MetaSkip[onFileSkipped 'metadata-updated']
+  Same -->|否 / 无| Parse[parseDocument]
+  Parse -->|PDF| Pdf[pdfjs-dist 逐页提字]
+  Pdf --> OcrCheck{每页 < ocrTriggerChars\n 且 ocrEnabled?}
+  OcrCheck -->|是| Render[pdftoppm 渲染 PNG → OCR]
+  OcrCheck -->|否| Text[直接用 pdfjs 文字]
+  Parse -->|docx/xlsx/pptx| Off[officeparser 一段大段文本]
+  Parse -->|txt/md/html| Plain[readFile + stripHtml（仅 html）]
+  Render --> Chunk
+  Text --> Chunk
+  Off --> Chunk
+  Plain --> Chunk
+  Chunk[recursiveChunk\n段落→句子→字数] --> Embed[逐 chunk embed（串行）]
+  Embed --> Store[replaceDocChunksByPath]
+  Store --> OK[onFileIndexed 'document']
+```
+
+### 13.2 解析与 OCR 回落
+
+- **PDF**：`pdfjs-dist` 按页提取 `textContent` 字符；页字符数 < `document.ocrTriggerChars`（默认 30）且 OCR 启用时，调 `pdftoppm -png -r 200 -f N -l N` 渲染该页为 PNG，再经 `IOcrProvider.extractText` 得文字。`pdftoppm` 缺失会抛 `DocumentParseError: pdftoppm not found in PATH (请安装 poppler-utils)`。代码：`src/doc-parser.ts`。
+- **docx/xlsx/pptx**：`officeparser.parseOfficeAsync` 直接返回整份文档纯文本（无结构化 heading；一期不拆章节）。
+- **txt / md / markdown**：`fs.readFile` 原文。
+- **html / htm**：简单正则去 `<script>/<style>` 后把块级标签转换行，实体解码后喂 chunker。
+
+### 13.3 切分
+
+`recursiveChunk`（`src/doc-chunker.ts`）：把 `ChunkerSegment[]` 摊平成 units(paragraph → sentence → hardcut)，贪心累加到 `chunkSize` 字符，chunk 之间保留 `chunkOverlap` 字符尾作为下一 chunk 前缀。句子分隔符：`。？！；\n.?!;`。
+
+### 13.4 Embedding
+
+对每个 chunk 的 `chunkText` 单独 `await embeddings.embed`，串行跑。理由：Ollama 嵌入没有批接口，串行也能尊重限流。
+
+### 13.5 一致性检查
+
+- **hash 同 + size/mtime 同** → `onFileSkipped 'unchanged'`。
+- **hash 同 + size/mtime 变** → `replaceDocChunksByPath` 复用每条旧 chunk 的 `chunkText + vector`，仅刷新 size/mtime/fileCreatedAt → `onFileSkipped 'metadata-updated'`。
+- **hash 变 / 无记录** → 重新 parse + chunk + embed + `replaceDocChunksByPath`。
+
+### 13.6 失败语义
+
+`indexDocumentFile` 抛错回到 `indexFile` 外层 catch，与 image/audio 共用：
+- 临时错误（ollama/timeout/fetch failed 等）：重试 3 次，60s 间隔。
+- 永久错误（DRM、坏文件、空文档 "Document parse produced no chunks"、OCR 失败等）：写入 `broken-files.json`，后续 unchanged 的同文件直接跳过。
+
+### 13.7 启动自愈
+
+`scanAndIndexMissingFiles` 的 `supportedExts` 会并入 `fileTypes.document`；`listAllEntries` + `listIndexedDocPaths` 共同构成"已索引路径集合"。`cleanupMissingIndexedFiles` 并行调 `storage.cleanupMissingEntries`（media）与 `storage.cleanupMissingDocChunks`（document）。删除事件 `handleFileDeleted` 对 document 直接调 `deleteDocChunksByPath`。

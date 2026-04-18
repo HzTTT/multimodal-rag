@@ -96,9 +96,9 @@ export function registerMultimodalRagCli(
     // openclaw multimodal-rag search <query>
     rag
       .command("search")
-      .description("搜索媒体文件")
+      .description("搜索媒体/文档")
       .argument("<query>", "搜索查询")
-      .option("--type <type>", "媒体类型: image, audio, all", "all")
+      .option("--type <type>", "类型: image, audio, document, all", "all")
       .option("--after <date>", "开始时间 (ISO 格式)")
       .option("--before <date>", "结束时间 (ISO 格式)")
       .option("--limit <n>", "返回数量", "5")
@@ -124,7 +124,7 @@ export function registerMultimodalRagCli(
 
           const vector = await embeddings.embed(normalizedQuery);
 
-          const results = await storage.search(vector, {
+          const unified = await storage.unifiedSearch(vector, {
             type: opts.type,
             after: afterTs,
             before: beforeTs,
@@ -132,36 +132,85 @@ export function registerMultimodalRagCli(
             minScore: 0.3,
           });
 
-          const { existingIds, missingCandidates } = await splitCliExistingAndMissingCandidates(
-            results.map((r) => ({ id: r.entry.id, filePath: r.entry.filePath })),
-          );
+          // 媒体结果存在性检查 + 清理
+          const mediaCandidates = unified
+            .filter((r): r is Extract<typeof unified[number], { kind: "media" }> => r.kind === "media")
+            .map((r) => ({ id: r.entry.id, filePath: r.entry.filePath }));
+          const { existingIds, missingCandidates } =
+            await splitCliExistingAndMissingCandidates(mediaCandidates);
           let cleanedMissing = 0;
           if (missingCandidates.length > 0) {
-            const cleanupResult = await storage.cleanupMissingEntries({
+            const mediaCleanup = await storage.cleanupMissingEntries({
               candidates: missingCandidates,
               dryRun: false,
             });
-            cleanedMissing = cleanupResult.removed;
+            cleanedMissing += mediaCleanup.removed;
           }
-          const visibleResults = results.filter((r) => existingIds.has(r.entry.id));
 
-          if (visibleResults.length === 0) {
+          // 文档结果存在性检查 + 清理
+          const docPaths = unified
+            .filter((r): r is Extract<typeof unified[number], { kind: "document" }> => r.kind === "document")
+            .map((r) => r.doc.filePath);
+          const existingDocPaths = new Set<string>();
+          const missingDocPaths: string[] = [];
+          for (const p of docPaths) {
+            try {
+              await stat(p);
+              existingDocPaths.add(p);
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              if (code === "ENOENT" || code === "ENOTDIR") {
+                missingDocPaths.push(p);
+              } else {
+                existingDocPaths.add(p);
+              }
+            }
+          }
+          if (missingDocPaths.length > 0) {
+            const docCleanup = await storage.cleanupMissingDocChunks({
+              candidates: missingDocPaths,
+              dryRun: false,
+            });
+            cleanedMissing += docCleanup.removedChunks;
+          }
+
+          const visible = unified.filter((r) => {
+            if (r.kind === "media") return existingIds.has(r.entry.id);
+            return existingDocPaths.has(r.doc.filePath);
+          });
+
+          if (visible.length === 0) {
             if (cleanedMissing > 0) {
-              console.log(`未找到相关媒体文件（已自动清理 ${cleanedMissing} 条失效索引）`);
+              console.log(`未找到相关内容（已自动清理 ${cleanedMissing} 条失效索引）`);
             } else {
-              console.log("未找到相关媒体文件");
+              console.log("未找到相关内容");
             }
             return;
           }
 
-          console.log(`找到 ${visibleResults.length} 个相关媒体文件:\n`);
-          for (const r of visibleResults) {
-            const date = new Date(r.entry.fileCreatedAt).toLocaleString("zh-CN");
-            const score = (r.score * 100).toFixed(0);
-            console.log(`[${r.entry.fileType}] ${r.entry.fileName} (${score}%)`);
-            console.log(`  路径: ${r.entry.filePath}`);
-            console.log(`  时间: ${date}`);
-            console.log(`  描述: ${r.entry.description.slice(0, 100)}...\n`);
+          console.log(`找到 ${visible.length} 条相关结果:\n`);
+          for (const r of visible) {
+            if (r.kind === "media") {
+              const date = new Date(r.entry.fileCreatedAt).toLocaleString("zh-CN");
+              const score = (r.score * 100).toFixed(0);
+              console.log(`[${r.entry.fileType}] ${r.entry.fileName} (${score}%)`);
+              console.log(`  路径: ${r.entry.filePath}`);
+              console.log(`  时间: ${date}`);
+              console.log(`  描述: ${r.entry.description.slice(0, 100)}...\n`);
+            } else {
+              const doc = r.doc;
+              const date = new Date(doc.fileCreatedAt).toLocaleString("zh-CN");
+              const score = (r.score * 100).toFixed(0);
+              const loc: string[] = [];
+              if (doc.topPageNumber > 0) loc.push(`p.${doc.topPageNumber}`);
+              if (doc.topHeading) loc.push(doc.topHeading);
+              const locSuffix = loc.length > 0 ? `  (${loc.join(" · ")})` : "";
+              console.log(`[document${doc.fileExt}] ${doc.fileName} (${score}%)`);
+              console.log(`  路径: ${doc.filePath}`);
+              console.log(`  时间: ${date}`);
+              console.log(`  段数: ${doc.totalChunks}${locSuffix}`);
+              console.log(`  摘录: ${doc.snippet}\n`);
+            }
           }
           if (cleanedMissing > 0) {
             console.log(`已自动清理 ${cleanedMissing} 条失效索引。`);
@@ -178,17 +227,20 @@ export function registerMultimodalRagCli(
       .description("显示索引统计")
       .action(async () => {
         try {
-          const total = await storage.count();
-          const imageCount = await storage.count("image");
-          const audioCount = await storage.count("audio");
+          const [imageCount, audioCount, docCount, docChunksCount] = await Promise.all([
+            storage.count("image"),
+            storage.count("audio"),
+            storage.countDocs(),
+            storage.countDocChunks(),
+          ]);
+          const mediaTotal = imageCount + audioCount;
+          const total = mediaTotal + docCount;
 
-          console.log("媒体库统计:");
-          console.log(`  总计: ${total} 个文件`);
+          console.log("知识库统计:");
+          console.log(`  总计: ${total} 份`);
           console.log(`  图片: ${imageCount} 个`);
           console.log(`  音频: ${audioCount} 个`);
-          if (total !== imageCount + audioCount) {
-            console.log(`  警告: 总数不匹配 (${total} ≠ ${imageCount} + ${audioCount})`);
-          }
+          console.log(`  文档: ${docCount} 份 (${docChunksCount} 个切片)`);
         } catch (error) {
           console.error(`统计失败: ${String(error)}`);
           process.exit(1);
@@ -212,8 +264,8 @@ export function registerMultimodalRagCli(
     // openclaw multimodal-rag list
     rag
       .command("list")
-      .description("列出已索引的媒体文件")
-      .option("--type <type>", "媒体类型: image, audio, all", "all")
+      .description("列出已索引的媒体/文档")
+      .option("--type <type>", "类型: image, audio, document, all", "all")
       .option("--after <date>", "开始时间 (ISO 格式)")
       .option("--before <date>", "结束时间 (ISO 格式)")
       .option("--limit <n>", "返回数量", "20")
@@ -237,6 +289,71 @@ export function registerMultimodalRagCli(
             min: 0,
             defaultValue: 0,
           });
+
+          // type=document 独立走 doc_chunks 表
+          if (opts.type === "document") {
+            const { total, docs } = await storage.listDocSummaries({
+              after: afterTs,
+              before: beforeTs,
+              limit,
+              offset,
+            });
+
+            const existingDocs: typeof docs = [];
+            const missingDocPaths: string[] = [];
+            for (const d of docs) {
+              try {
+                await stat(d.filePath);
+                existingDocs.push(d);
+              } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code === "ENOENT" || code === "ENOTDIR") {
+                  missingDocPaths.push(d.filePath);
+                } else {
+                  existingDocs.push(d);
+                }
+              }
+            }
+            let cleanedMissing = 0;
+            if (missingDocPaths.length > 0) {
+              const cleanup = await storage.cleanupMissingDocChunks({
+                candidates: missingDocPaths,
+                dryRun: false,
+              });
+              cleanedMissing = cleanup.removedChunks;
+            }
+
+            if (existingDocs.length === 0) {
+              if (cleanedMissing > 0) {
+                console.log(`没有找到符合条件的文档（已自动清理 ${cleanedMissing} 条失效索引）`);
+              } else {
+                console.log("没有找到符合条件的文档");
+              }
+              return;
+            }
+
+            console.log(`已索引 ${total} 份文档:\n`);
+            for (let i = 0; i < existingDocs.length; i++) {
+              const d = existingDocs[i];
+              const date = new Date(d.fileCreatedAt).toLocaleString("zh-CN");
+              const loc: string[] = [];
+              if (d.topPageNumber > 0) loc.push(`p.${d.topPageNumber}`);
+              if (d.topHeading) loc.push(d.topHeading);
+              const locSuffix = loc.length > 0 ? `  (${loc.join(" · ")})` : "";
+              console.log(`${offset + i + 1}. [document${d.fileExt}] ${d.fileName}`);
+              console.log(`   路径: ${d.filePath}`);
+              console.log(`   时间: ${date}`);
+              console.log(`   段数: ${d.totalChunks}${locSuffix}`);
+              console.log(`   摘录: ${d.snippet}\n`);
+            }
+            if (total > offset + existingDocs.length) {
+              console.log(`（显示 ${offset + 1}-${offset + existingDocs.length}，共 ${total} 份）`);
+            }
+            if (cleanedMissing > 0) {
+              console.log(`已自动清理 ${cleanedMissing} 条失效索引。`);
+            }
+            return;
+          }
 
           const { total, entries } = await storage.list({
             type: opts.type,

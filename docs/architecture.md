@@ -309,8 +309,26 @@ stateDiagram-v2
 | `plugin-runtime.ts` | Barrel：嵌入提供者工厂 / 通知器 / 处理器 / 存储层 / 工具注册 / 监听服务 / whisper 可执行文件解析 / 配置类型 |
 | `src/runtime.ts` | 插件运行时类型、运行时缓存、运行时初始化、按需创建嵌入提供者、向量维度推断、Agent 工具注册、后台服务注册 |
 | `src/storage.ts` | LanceDB 存储层（详见 [storage.md](./storage.md)）|
-| `src/types.ts` | `MediaEntry` / `MediaSearchResult` / `MediaType` / `PluginConfig` / `IEmbeddingProvider` / `IMediaProcessor` / `NotificationConfig` / `IndexEventCallbacks` |
+| `src/types.ts` | `MediaEntry` / `DocChunkEntry` / `UnifiedSearchResult` / `MediaSearchResult` / `MediaType` / `PluginConfig` / `IEmbeddingProvider` / `IMediaProcessor` / `IOcrProvider` / `NotificationConfig` / `IndexEventCallbacks` |
 | `openclaw.plugin.json` | manifest：id、版本、`configSchema`（JSON Schema）、`uiHints`（标签/sensitive/advanced）|
-| `package.json` | 依赖：`@lancedb/lancedb`、schema 校验工具、`apache-arrow`、chokidar；详细版本号请参见 `package.json` |
+| `package.json` | 依赖：`@lancedb/lancedb`、schema 校验工具、`apache-arrow`、chokidar、`pdfjs-dist`、`officeparser` |
+
+---
+
+## 8. 文档（document）子系统
+
+文档索引是 image/audio 之外的第三条主链路，由三个新模块和一张独立的 LanceDB 表构成。
+
+| 模块 | 职责 | 源文件 |
+|---|---|---|
+| `DocumentParser`（按扩展名分派） | PDF → `pdfjs-dist` 逐页提字；docx/xlsx/pptx → `officeparser`；txt/md/html → `readFile` | `src/doc-parser.ts` |
+| `recursiveChunk` | 递归"段落(\n\n) → 句子 → 字数"三级拆分，拼 chunk 带 overlap | `src/doc-chunker.ts` |
+| `OcrProvider` + `OllamaVlmOcrProvider` | 扫描页 PDF 回落：`pdftoppm` 渲染成 PNG → Ollama VLM 提文字 | `src/ocr.ts` |
+| `IMediaProcessor.processDocument` | 串联 parse → chunk → 返回 `DocumentChunkInput[]`；embedding 在 watcher 里做 | `src/processor.ts` |
+| LanceDB `doc_chunks` 表 | 每个文档切成 N 行 chunk；schema 见 [storage.md](./storage.md) | `src/storage.ts` |
+
+运行时初始化会按 `config.document.ocrEnabled` 构造 OCR provider 并注入处理器；`ollama.ocrModel` 留空则复用 `visionModel`。详见 `src/runtime.ts` 的 `createOcrProviderIfEnabled`。
+
+索引链路见 [indexing-pipeline.md §13](./indexing-pipeline.md)；配置字段见 [configuration.md §2.6](./configuration.md)。
 
 > 接下来推荐阅读：[LanceDB 存储层细节](./storage.md)。

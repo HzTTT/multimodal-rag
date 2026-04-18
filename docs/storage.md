@@ -424,8 +424,57 @@ flowchart TD
 | 路径 | 角色 |
 |---|---|
 | `src/storage.ts` | 本文档全部内容的实现 |
-| `src/types.ts` | `MediaEntry` / `MediaSearchResult` / `MediaType` schema |
+| `src/types.ts` | `MediaEntry` / `DocChunkEntry` / `MediaSearchResult` / `DocChunkSearchResult` / `UnifiedSearchResult` / `MediaType` schema |
 | `src/runtime.ts` | 在运行时初始化中实例化存储层（参见 [architecture.md §5.3](./architecture.md#53-向量维度推断) 关于向量维度）|
 | `package.json` | `@lancedb/lancedb` 与 `apache-arrow` 依赖 |
+
+---
+
+## 11. 文档（document）子表：`doc_chunks`
+
+与 `media` 表并行存在的第二张 LanceDB 表，专用于文档（PDF/docx/xlsx/pptx/txt/md/html）。一个文件 → N 条 chunk。
+
+### 11.1 表结构
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | `string` | UUID，单行主键 |
+| `docId` | `string` | 同一文档的 chunks 共享（当前等于文件 `sha256`） |
+| `filePath` | `string` | 源文件路径（每行冗余，便于路径过滤） |
+| `fileName` | `string` | `basename(filePath)` |
+| `fileExt` | `string` | 小写扩展名带点（例如 `.pdf`） |
+| `chunkIndex` | `number` | 0-based |
+| `totalChunks` | `number` | 该文档总段数（冗余，便于展示） |
+| `pageNumber` | `number` | PDF 页码（1-based），非 PDF 为 `0` |
+| `heading` | `string` | 所属标题链（一期恒为 `""`，docx heading 切分预留） |
+| `chunkText` | `string` | 切分后的原文段落 |
+| `vector` | `number[]` | 嵌入向量，维度与 `media` 表一致（同一 embedding provider） |
+| `fileHash` | `string` | 文件 sha256（hash 级一致性检查） |
+| `fileSize` / `fileCreatedAt` / `fileModifiedAt` / `indexedAt` | `number` | 元数据（与 media 表语义一致） |
+
+标量索引：`fileExt`（bitmap）与 `fileCreatedAt`（btree），见 `src/storage.ts:DOC_CHUNKS_SCALAR_INDICES`。
+
+### 11.2 主要 API
+
+| 方法 | 用途 |
+|---|---|
+| `storeDocChunks(chunks)` | 批量插入 |
+| `replaceDocChunksByPath(path, chunks)` | 先按路径删光旧 chunks 再插新的 |
+| `findDocChunksByPath(path)` | 按路径查，返回含 vector 的 `DocChunkEntry[]`（用于 metadata-only 复用） |
+| `findDocChunksByHash(hash, limit?)` | 按 hash 查（move-reuse 基础设施，一期未启用） |
+| `deleteDocChunksByPath(path)` | 按路径删除所有 chunks |
+| `searchDocChunks(vector, options)` | chunk 粒度向量搜索，返回 `DocChunkSearchResult[]` |
+| `searchDocsAggregated(vector, options)` | 按 `docId` 聚合 → 每文件最高分 chunk + snippet（供 `media_search`） |
+| `listDocSummaries(options)` | 按路径分组列出文档（供 `media_list type='document'`） |
+| `countDocs()` / `countDocChunks()` / `listIndexedDocPaths()` | 统计与启动自愈 |
+| `cleanupMissingDocChunks({ dryRun, candidates })` | 清理"索引存在但源文件丢失"的文档 chunks |
+| `unifiedSearch(vector, options)` | 并发查 media + doc_chunks，返回按分数合并的 `UnifiedSearchResult[]`（供 `media_search` / `/search_file`） |
+
+### 11.3 与 media 表的差异
+
+- **文件粒度 vs chunk 粒度**：media 表一文件一行；`doc_chunks` 一文件 N 行，通过 `docId`/`filePath` 聚合。
+- **move-reuse**：仅 media 表启用；document 搬迁一期直接重解析重索引（`findMovedSourceByHash` 只接 `"image"|"audio"`）。
+- **fileType 字段**：media 表使用 `fileType`；`doc_chunks` 无该字段，类型由 `fileExt` 表达。
+- **失败脏数据清理**：`cleanupFailedMediaEntries` 只扫 media 表；document 的失败由 watcher 的 broken-file marker 独立管理。
 
 > 回到 [系统架构](./architecture.md) 或 [README](../README.md)。

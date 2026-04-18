@@ -9,10 +9,12 @@ import { homedir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
 import type { MediaStorage } from "./storage.js";
 import type {
+  DocSummary,
   IEmbeddingProvider,
   IMediaProcessor,
   MediaType,
   PluginConfig,
+  UnifiedSearchResult,
 } from "./types.js";
 import type { MediaWatcher } from "./watcher.js";
 
@@ -201,28 +203,29 @@ export function createMediaSearchTool(
     name: "media_search",
     label: "Media Search",
     description:
-      "对已索引的本地媒体库做语义搜索（图片描述 / 音频转录）。\n\n" +
+      "对已索引的本地知识库做语义搜索（图片描述 / 音频转录 / 文档内容）。\n\n" +
       "能力边界：\n" +
-      "- 仅能搜索“已完成索引”的数据（即数据库里已有 description + embedding 的条目）\n" +
-      "- 如果文件刚产生、尚未索引完，语义搜索可能搜不到；此时可用 `media_list`（includeUnindexed=true）从磁盘侧拿到真实文件路径\n\n" +
+      "- 仅能搜索“已完成索引”的数据（即数据库里已有 description/chunk + embedding 的条目）\n" +
+      "- 如果文件刚产生、尚未索引完，语义搜索可能搜不到；此时可用 `media_list`（includeUnindexed=true）从磁盘侧拿到真实文件路径\n" +
+      "- 文档结果按文件聚合展示：每个文件一行 + 最高分 chunk 的摘录（snippet），便于 agent 判断相关性\n\n" +
       "搜索类型：\n" +
       "- type='audio': 搜索录音转录文本\n" +
       "- type='image': 搜索图片描述\n" +
+      "- type='document': 搜索文档内容（PDF / Word / Excel / PPT / 纯文本）\n" +
       "- type='all': 同时搜索（默认）\n\n" +
-      "**【强制要求】立即发送媒体给用户**：\n" +
-      "⚠️ 搜索到结果后，你必须立即将媒体文件发送给用户！\n" +
-      "❌ 禁止询问'需要我发送给你吗？'\n" +
-      "❌ 禁止只描述文件内容而不发送实际文件\n" +
-      "✅ 根据当前聊天渠道，使用该渠道对应的方式发送图片/音频文件\n" +
-      "发送最匹配的 1-3 个文件，同时简要说明每个文件的内容。",
+      "**【强制要求】立即响应用户**：\n" +
+      "⚠️ 搜到 image/audio 文件时，必须立即将媒体文件发送给用户（根据当前渠道）。\n" +
+      "⚠️ 搜到 document 时，至少在回复里给出文件路径和 snippet，方便用户定位原文。\n" +
+      "发送最匹配的 1-3 个结果，同时简要说明每个结果的内容。",
     parameters: Type.Object({
       query: Type.String({
-        description: "搜索关键词或内容描述。应该是简短的关键词，如'东方明珠'、'会议'、'食物'，而不是完整问句",
+        description: "搜索关键词或内容描述。应该是简短的关键词，如'东方明珠'、'会议'、'食物'、'季度财报'，而不是完整问句",
       }),
       type: Type.Optional(
         Type.Union([
           Type.Literal("image"),
           Type.Literal("audio"),
+          Type.Literal("document"),
           Type.Literal("all"),
         ]),
       ),
@@ -278,7 +281,10 @@ export function createMediaSearchTool(
         };
       }
 
-      const parsedLimit = parsePositiveInt(limit, "limit", { min: 1, defaultValue: 5 });
+      const parsedLimit = parsePositiveInt(limit, "limit", {
+        min: 1,
+        defaultValue: 5,
+      });
       if (parsedLimit.error) {
         return {
           content: makeTextContent(parsedLimit.error),
@@ -286,126 +292,159 @@ export function createMediaSearchTool(
         };
       }
 
-      // 调试日志
-      console.log(`[multimodal-rag] media_search called with query: "${normalizedQuery}"`);
       console.log(
-        `[multimodal-rag] embeddings provider available: ${!!embeddings}`,
+        `[multimodal-rag] media_search called with query: "${normalizedQuery}" type=${type}`,
       );
-      console.log(`[multimodal-rag] storage available: ${!!storage}`);
 
       try {
-        // 生成查询向量
-        console.log(`[multimodal-rag] Generating embedding for: "${normalizedQuery}"`);
         const vector = await embeddings.embed(normalizedQuery);
-        console.log(
-          `[multimodal-rag] Embedding generated, dimension: ${vector?.length}`,
-        );
-
-        // 解析时间参数
         const afterTs = parsedAfter.value;
         const beforeTs = parsedBefore.value;
 
-        // 搜索（降低阈值以提高召回）
-        console.log(`[multimodal-rag] Searching with options: type=${type}, after=${afterTs}, before=${beforeTs}, limit=${parsedLimit.value}`);
-        const results = await storage.search(vector, {
+        const unified = await storage.unifiedSearch(vector, {
           type: type as MediaType | "all",
           after: afterTs,
           before: beforeTs,
           limit: parsedLimit.value,
-          minScore: 0.25, // 降低阈值：25% 以上即返回
+          minScore: 0.25,
         });
-        console.log(`[multimodal-rag] Search returned ${results.length} results`);
-
-        const { existingIds, missingCandidates } = await splitExistingAndMissingCandidates(
-          results.map((r) => ({ id: r.entry.id, filePath: r.entry.filePath })),
+        console.log(
+          `[multimodal-rag] unifiedSearch returned ${unified.length} results`,
         );
-        let cleanedMissing = 0;
+
+        // 媒体结果：过滤已删除文件，并清理失效索引
+        const mediaCandidates = unified
+          .filter((r): r is Extract<UnifiedSearchResult, { kind: "media" }> => r.kind === "media")
+          .map((r) => ({ id: r.entry.id, filePath: r.entry.filePath }));
+        const { existingIds, missingCandidates } =
+          await splitExistingAndMissingCandidates(mediaCandidates);
+        let cleanedMissingMedia = 0;
         if (missingCandidates.length > 0) {
-          const cleanupResult = await storage.cleanupMissingEntries({
+          const cleanup = await storage.cleanupMissingEntries({
             candidates: missingCandidates,
             dryRun: false,
           });
-          cleanedMissing = cleanupResult.removed;
-          console.log(
-            `[multimodal-rag] Cleaned ${cleanedMissing} missing indexed record(s) in search`,
-          );
+          cleanedMissingMedia = cleanup.removed;
         }
-        const visibleResults = results.filter((r) => existingIds.has(r.entry.id));
 
-        if (visibleResults.length === 0) {
-          // 获取媒体库统计
+        // 文档结果：过滤已删除原文件，并清理失效 chunks
+        const docPaths = unified
+          .filter((r): r is Extract<UnifiedSearchResult, { kind: "document" }> => r.kind === "document")
+          .map((r) => r.doc.filePath);
+        const existingDocPaths = new Set<string>();
+        const missingDocPaths: string[] = [];
+        for (const p of docPaths) {
+          try {
+            await stat(p);
+            existingDocPaths.add(p);
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "ENOTDIR") {
+              missingDocPaths.push(p);
+            } else {
+              existingDocPaths.add(p);
+            }
+          }
+        }
+        let cleanedMissingDocs = 0;
+        if (missingDocPaths.length > 0) {
+          const cleanup = await storage.cleanupMissingDocChunks({
+            candidates: missingDocPaths,
+            dryRun: false,
+          });
+          cleanedMissingDocs = cleanup.removedChunks;
+        }
+
+        const visible = unified.filter((r) => {
+          if (r.kind === "media") return existingIds.has(r.entry.id);
+          return existingDocPaths.has(r.doc.filePath);
+        });
+
+        const cleanedMissing = cleanedMissingMedia + cleanedMissingDocs;
+
+        if (visible.length === 0) {
           const totalCount = await storage.count();
+          const docCount = await storage.countDocs();
           const cleanupHint =
-            cleanedMissing > 0 ? `\n\n已自动清理 ${cleanedMissing} 条“源文件已删除”的失效索引。` : "";
+            cleanedMissing > 0
+              ? `\n\n已自动清理 ${cleanedMissing} 条“源文件已删除”的失效索引。`
+              : "";
           return {
             content: makeTextContent(
-              `未找到与「${normalizedQuery}」相关的媒体文件。\n\n数据库中共有 ${totalCount} 个已索引文件。建议：\n1. 尝试使用更通用的关键词\n2. 使用 media_list 工具浏览所有文件\n3. 调整时间范围（如果设置了 after/before）${cleanupHint}`,
+              `未找到与「${normalizedQuery}」相关的内容。\n\n知识库中共有 ${totalCount} 个媒体文件 + ${docCount} 个文档。建议：\n1. 尝试使用更通用的关键词\n2. 使用 media_list 浏览文件列表\n3. 调整时间范围（如果设置了 after/before）${cleanupHint}`,
             ),
             details: {
               count: 0,
               query: normalizedQuery,
-              totalInDatabase: totalCount,
+              totalMediaInDatabase: totalCount,
+              totalDocsInDatabase: docCount,
               cleanedMissing,
               suggestion: "try_broader_keywords_or_use_media_list",
             },
           };
         }
 
-      // 格式化结果（提供完整信息）
-      const text = visibleResults
-        .map((r, i) => {
-          const date = new Date(r.entry.fileCreatedAt).toLocaleString(
-            "zh-CN",
-            {
-              year: "numeric",
-              month: "2-digit",
-              day: "2-digit",
-              hour: "2-digit",
-              minute: "2-digit",
-            },
-          );
-          const scorePercent = (r.score * 100).toFixed(0);
-          const description = r.entry.description;
-          return `${i + 1}. [${r.entry.fileType}] ${r.entry.fileName} (匹配度: ${scorePercent}%)\n   📁 路径: ${r.entry.filePath}\n   📅 时间: ${date}\n   📝 描述: ${description}`;
-        })
-        .join("\n\n");
+        const text = visible
+          .map((r, i) => formatUnifiedHit(r, i + 1))
+          .join("\n\n");
 
-      // 清理结果（移除不可序列化的数据）
-      const sanitizedResults = visibleResults.map((r) => ({
-        filePath: r.entry.filePath,
-        fileName: r.entry.fileName,
-        type: r.entry.fileType,
-        description: r.entry.description,
-        matchScore: Number.parseFloat((r.score * 100).toFixed(1)), // 百分比格式
-        fileCreatedAt: new Date(r.entry.fileCreatedAt).toISOString(),
-        fileModifiedAt: new Date(r.entry.fileModifiedAt).toISOString(),
-      }));
+        const sanitized = visible.map((r) => {
+          if (r.kind === "media") {
+            return {
+              kind: "media" as const,
+              filePath: r.entry.filePath,
+              fileName: r.entry.fileName,
+              type: r.entry.fileType,
+              description: r.entry.description,
+              matchScore: Number.parseFloat((r.score * 100).toFixed(1)),
+              fileCreatedAt: new Date(r.entry.fileCreatedAt).toISOString(),
+              fileModifiedAt: new Date(r.entry.fileModifiedAt).toISOString(),
+            };
+          }
+          const doc = r.doc;
+          return {
+            kind: "document" as const,
+            filePath: doc.filePath,
+            fileName: doc.fileName,
+            type: "document" as const,
+            fileExt: doc.fileExt,
+            snippet: doc.snippet,
+            topPageNumber: doc.topPageNumber || undefined,
+            topHeading: doc.topHeading || undefined,
+            totalChunks: doc.totalChunks,
+            matchScore: Number.parseFloat((r.score * 100).toFixed(1)),
+            fileCreatedAt: new Date(doc.fileCreatedAt).toISOString(),
+            fileModifiedAt: new Date(doc.fileModifiedAt).toISOString(),
+          };
+        });
 
-      // 计算最高匹配度
-      const maxScore = visibleResults[0].score * 100;
-      const confidence =
-        maxScore > 60 ? "高" : maxScore > 40 ? "中" : "低";
+        const maxScore = visible[0].score * 100;
+        const confidence = maxScore > 60 ? "高" : maxScore > 40 ? "中" : "低";
 
-      return {
-        content: makeTextContent(
-          `✅ 找到 ${visibleResults.length} 个相关媒体文件（置信度: ${confidence}）：\n\n${text}\n\n⚠️ 立即使用当前聊天渠道对应的方式将上述文件发送给用户！`,
-        ),
-        details: {
-          count: visibleResults.length,
-          query: normalizedQuery,
-          maxMatchScore: Number.parseFloat(maxScore.toFixed(1)),
-          confidence,
-          cleanedMissing,
-          results: sanitizedResults,
-        },
-      };
+        return {
+          content: makeTextContent(
+            `✅ 找到 ${visible.length} 条相关结果（置信度: ${confidence}）：\n\n${text}\n\n⚠️ 若是 image/audio，请立即使用当前渠道把文件发送给用户；若是 document，请在回复里附上路径与 snippet。`,
+          ),
+          details: {
+            count: visible.length,
+            query: normalizedQuery,
+            maxMatchScore: Number.parseFloat(maxScore.toFixed(1)),
+            confidence,
+            cleanedMissing,
+            cleanedMissingMedia,
+            cleanedMissingDocs,
+            results: sanitized,
+          },
+        };
       } catch (error) {
-        // 错误处理：embedding 或搜索失败时返回友好信息
-        console.error(`[multimodal-rag] Search error for query "${normalizedQuery}":`, error);
+        console.error(
+          `[multimodal-rag] Search error for query "${normalizedQuery}":`,
+          error,
+        );
         const totalCount = await storage.count().catch(() => 0);
         return {
           content: makeTextContent(
-            `搜索时遇到技术问题，请稍后重试。\n\n数据库中共有 ${totalCount} 个已索引文件。\n错误详情: ${error instanceof Error ? error.message : String(error)}`,
+            `搜索时遇到技术问题，请稍后重试。\n\n数据库中共有 ${totalCount} 个已索引媒体文件。\n错误详情: ${error instanceof Error ? error.message : String(error)}`,
           ),
           details: {
             count: 0,
@@ -417,6 +456,51 @@ export function createMediaSearchTool(
       }
     },
   };
+}
+
+function formatDocSummary(doc: DocSummary, rank: number): string {
+  const date = new Date(doc.fileCreatedAt).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const locationHints: string[] = [];
+  if (doc.topPageNumber > 0) locationHints.push(`p.${doc.topPageNumber}`);
+  if (doc.topHeading) locationHints.push(doc.topHeading);
+  const locationSuffix =
+    locationHints.length > 0 ? `  （${locationHints.join(" · ")}）` : "";
+  return `${rank}. [document${doc.fileExt ? doc.fileExt : ""}] ${doc.fileName}\n   📁 ${doc.filePath}\n   📅 ${date}\n   🧩 段数: ${doc.totalChunks}${locationSuffix}\n   📝 ${doc.snippet}`;
+}
+
+function formatUnifiedHit(result: UnifiedSearchResult, rank: number): string {
+  const scorePercent = (result.score * 100).toFixed(0);
+  if (result.kind === "media") {
+    const entry = result.entry;
+    const date = new Date(entry.fileCreatedAt).toLocaleString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    return `${rank}. [${entry.fileType}] ${entry.fileName} (匹配度: ${scorePercent}%)\n   📁 路径: ${entry.filePath}\n   📅 时间: ${date}\n   📝 描述: ${entry.description}`;
+  }
+  const doc = result.doc;
+  const date = new Date(doc.fileCreatedAt).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const locationHints: string[] = [];
+  if (doc.topPageNumber > 0) locationHints.push(`p.${doc.topPageNumber}`);
+  if (doc.topHeading) locationHints.push(doc.topHeading);
+  const locationSuffix =
+    locationHints.length > 0 ? `  （${locationHints.join(" · ")}）` : "";
+  return `${rank}. [document${doc.fileExt ? doc.fileExt : ""}] ${doc.fileName} (匹配度: ${scorePercent}%)\n   📁 路径: ${doc.filePath}\n   📅 时间: ${date}\n   🧩 段数: ${doc.totalChunks}${locationSuffix}\n   📝 摘录: ${doc.snippet}`;
 }
 
 /**
@@ -454,11 +538,10 @@ export function createMediaDescribeTool(
         };
       }
 
-      // 查找现有记录
       let entry = await storage.findByPath(normalizedPath);
+      let docChunks = entry ? [] : await storage.findDocChunksByPath(normalizedPath);
 
-      if (!entry || refresh) {
-        // 需要重新索引
+      if ((!entry && docChunks.length === 0) || refresh) {
         try {
           await watcher.indexPath(normalizedPath);
         } catch (error) {
@@ -469,8 +552,11 @@ export function createMediaDescribeTool(
           };
         }
         entry = await storage.findByPath(normalizedPath);
+        docChunks = entry
+          ? []
+          : await storage.findDocChunksByPath(normalizedPath);
 
-        if (!entry) {
+        if (!entry && docChunks.length === 0) {
           return {
             content: makeTextContent(
               `无法索引文件: ${normalizedPath}。请检查文件是否存在且为支持的格式。`,
@@ -480,20 +566,62 @@ export function createMediaDescribeTool(
         }
       }
 
-      const date = new Date(entry.fileCreatedAt).toLocaleString("zh-CN");
-      const indexedDate = new Date(entry.indexedAt).toLocaleString("zh-CN");
+      if (entry) {
+        const date = new Date(entry.fileCreatedAt).toLocaleString("zh-CN");
+        const indexedDate = new Date(entry.indexedAt).toLocaleString("zh-CN");
+        return {
+          content: makeTextContent(
+            `文件: ${entry.fileName}\n类型: ${entry.fileType}\n路径: ${entry.filePath}\n创建时间: ${date}\n索引时间: ${indexedDate}\n\n描述:\n${entry.description}`,
+          ),
+          details: {
+            filePath: entry.filePath,
+            fileName: entry.fileName,
+            type: entry.fileType,
+            description: entry.description,
+            fileCreatedAt: new Date(entry.fileCreatedAt).toISOString(),
+            indexedAt: new Date(entry.indexedAt).toISOString(),
+          },
+        };
+      }
+
+      // document 分支
+      const sorted = docChunks.slice().sort((a, b) => a.chunkIndex - b.chunkIndex);
+      const sample = sorted[0];
+      const date = new Date(sample.fileCreatedAt).toLocaleString("zh-CN");
+      const indexedDate = new Date(sample.indexedAt).toLocaleString("zh-CN");
+      const totalChars = sorted.reduce((n, c) => n + c.chunkText.length, 0);
+
+      // 预览前 3 段，每段最多 300 字
+      const preview = sorted
+        .slice(0, 3)
+        .map((c, i) => {
+          const loc: string[] = [];
+          if (c.pageNumber > 0) loc.push(`p.${c.pageNumber}`);
+          if (c.heading) loc.push(c.heading);
+          const locSuffix = loc.length > 0 ? ` (${loc.join(" · ")})` : "";
+          const snippet =
+            c.chunkText.length > 300 ? c.chunkText.slice(0, 300) + "…" : c.chunkText;
+          return `【第 ${c.chunkIndex + 1}/${sample.totalChunks} 段${locSuffix}】\n${snippet}`;
+        })
+        .join("\n\n");
+      const tailHint =
+        sample.totalChunks > 3
+          ? `\n\n…共 ${sample.totalChunks} 段，此处仅预览前 3 段。若要精确定位，用 media_search type='document' 做语义搜索。`
+          : "";
 
       return {
         content: makeTextContent(
-          `文件: ${entry.fileName}\n类型: ${entry.fileType}\n路径: ${entry.filePath}\n创建时间: ${date}\n索引时间: ${indexedDate}\n\n描述:\n${entry.description}`,
+          `文件: ${sample.fileName}\n类型: document (${sample.fileExt})\n路径: ${sample.filePath}\n创建时间: ${date}\n索引时间: ${indexedDate}\n段数: ${sample.totalChunks}  字符数: ${totalChars}\n\n预览:\n${preview}${tailHint}`,
         ),
         details: {
-          filePath: entry.filePath,
-          fileName: entry.fileName,
-          type: entry.fileType,
-          description: entry.description,
-          fileCreatedAt: new Date(entry.fileCreatedAt).toISOString(),
-          indexedAt: new Date(entry.indexedAt).toISOString(),
+          filePath: sample.filePath,
+          fileName: sample.fileName,
+          type: "document" as const,
+          fileExt: sample.fileExt,
+          totalChunks: sample.totalChunks,
+          totalChars,
+          fileCreatedAt: new Date(sample.fileCreatedAt).toISOString(),
+          indexedAt: new Date(sample.indexedAt).toISOString(),
         },
       };
     },
@@ -508,30 +636,41 @@ export function createMediaStatsTool(storage: MediaStorage, watcher?: MediaWatch
     name: "media_stats",
     label: "Media Statistics",
     description:
-      "获取用户个人知识库的统计信息（照片/录音数量）。当用户询问'有多少照片'、'有哪些文件'、'录了多少音'或想了解个人数据概况时使用。",
+      "获取用户个人知识库的统计信息（照片/录音/文档数量）。当用户询问'有多少照片'、'有哪些文件'、'录了多少音'、'有多少份 PDF'或想了解数据概况时使用。",
     parameters: Type.Object({}),
     async execute(_toolCallId: string, _params: any) {
-      const total = await storage.count();
-      const imageCount = await storage.count("image");
-      const audioCount = await storage.count("audio");
+      const [imageCount, audioCount, docCount, docChunksCount] = await Promise.all([
+        storage.count("image"),
+        storage.count("audio"),
+        storage.countDocs(),
+        storage.countDocChunks(),
+      ]);
+      const mediaTotal = imageCount + audioCount;
+      const total = mediaTotal + docCount;
       const queue = watcher?.getQueueStatus();
 
       if (total === 0) {
         return {
           content: makeTextContent(
-            "媒体库为空。\n\n" +
+            "知识库为空。\n\n" +
               (queue
                 ? `当前索引队列：处理中: ${queue.processing ?? "无"}，等待: ${queue.pending.length} 个\n\n`
                 : "") +
               "新文件会在添加到监听目录后自动索引。",
           ),
-          details: { total: 0, imageCount: 0, audioCount: 0 },
+          details: {
+            total: 0,
+            imageCount: 0,
+            audioCount: 0,
+            docCount: 0,
+            docChunksCount: 0,
+          },
         };
       }
 
       return {
         content: makeTextContent(
-          `📊 媒体库统计:\n\n总计: ${total} 个文件\n图片: ${imageCount} 个\n音频: ${audioCount} 个\n` +
+          `📊 知识库统计:\n\n总计: ${total} 份\n图片: ${imageCount} 个\n音频: ${audioCount} 个\n文档: ${docCount} 份 (${docChunksCount} 个切片)\n` +
             (queue
               ? `\n索引队列:\n- 处理中: ${queue.processing ?? "无"}\n- 等待: ${queue.pending.length} 个`
               : "") +
@@ -541,6 +680,8 @@ export function createMediaStatsTool(storage: MediaStorage, watcher?: MediaWatch
           total,
           imageCount,
           audioCount,
+          docCount,
+          docChunksCount,
           queue,
         },
       };
@@ -559,18 +700,19 @@ export function createMediaListTool(
     name: "media_list",
     label: "Media List",
     description:
-      "按时间倒序列出媒体文件（图片/音频）。\n\n" +
+      "按时间倒序列出媒体/文档文件。\n\n" +
       "数据来源：\n" +
-      "- 已索引文件：来自本插件的向量数据库（含 description）\n" +
-      "- 未索引文件：当 includeUnindexed=true 时，会额外扫描监听目录，返回“磁盘上存在但尚未完成索引”的新文件（indexed=false）。这类文件的 description 为空，通常需要后续调用 media_describe 触发分析。\n\n" +
-      "返回字段含义：\n" +
-      "- indexed=true：已索引，可直接基于 description 做判断/搜索\n" +
-      "- indexed=false：未索引，但文件路径真实存在，可直接发送或再调用 media_describe 获取详细分析",
+      "- 已索引文件：来自本插件的向量数据库（image/audio 含 description，document 含最高分 chunk 的 snippet）\n" +
+      "- 未索引文件：当 includeUnindexed=true 时，会额外扫描监听目录返回磁盘上存在但尚未完成索引的 image/audio（document 不走未索引兜底）\n\n" +
+      "查询类型：\n" +
+      "- type='image' / 'audio' / 'all'：走 media 表\n" +
+      "- type='document'：走 doc_chunks 表（按 filePath 聚合，每文件一条）",
     parameters: Type.Object({
       type: Type.Optional(
         Type.Union([
           Type.Literal("image"),
           Type.Literal("audio"),
+          Type.Literal("document"),
           Type.Literal("all"),
         ]),
       ),
@@ -656,6 +798,94 @@ export function createMediaListTool(
 
       const afterTs = parsedAfter.value;
       const beforeTs = parsedBefore.value;
+
+      // type='document' 独立走 doc_chunks 表（按 filePath 聚合）
+      if (type === "document") {
+        const { total, docs } = await storage.listDocSummaries({
+          after: afterTs,
+          before: beforeTs,
+          limit: parsedLimit.value,
+          offset: parsedOffset.value,
+        });
+
+        // 过滤已删除的原文件
+        const existingDocs: typeof docs = [];
+        const missingDocPaths: string[] = [];
+        for (const d of docs) {
+          try {
+            await stat(d.filePath);
+            existingDocs.push(d);
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "ENOTDIR") {
+              missingDocPaths.push(d.filePath);
+            } else {
+              existingDocs.push(d);
+            }
+          }
+        }
+        let cleanedMissing = 0;
+        if (missingDocPaths.length > 0) {
+          const cleanup = await storage.cleanupMissingDocChunks({
+            candidates: missingDocPaths,
+            dryRun: false,
+          });
+          cleanedMissing = cleanup.removedChunks;
+        }
+
+        if (existingDocs.length === 0) {
+          const totalDocs = await storage.countDocs();
+          const cleanupHint =
+            cleanedMissing > 0
+              ? `\n\n已自动清理 ${cleanedMissing} 条失效文档索引。`
+              : "";
+          return {
+            content: makeTextContent(
+              `没有找到符合条件的文档。\n\n知识库中共有 ${totalDocs} 份文档。${cleanupHint}`,
+            ),
+            details: {
+              total: 0,
+              totalInDatabase: totalDocs,
+              cleanedMissing,
+              files: [],
+            },
+          };
+        }
+
+        const text = existingDocs
+          .map((d, i) => formatDocSummary(d, parsedOffset.value + i + 1))
+          .join("\n\n");
+        const sanitized = existingDocs.map((d) => ({
+          filePath: d.filePath,
+          path: d.filePath,
+          fileName: d.fileName,
+          type: "document" as const,
+          fileExt: d.fileExt,
+          indexed: true as const,
+          snippet: d.snippet,
+          totalChunks: d.totalChunks,
+          fileCreatedAt: new Date(d.fileCreatedAt).toISOString(),
+          fileModifiedAt: new Date(d.fileModifiedAt).toISOString(),
+          indexedAt: d.indexedAt ? new Date(d.indexedAt).toISOString() : "",
+        }));
+        const pageInfo =
+          total > parsedOffset.value + parsedLimit.value
+            ? `\n\n（显示 ${parsedOffset.value + 1}-${parsedOffset.value + existingDocs.length}，共 ${total} 份。使用 offset 参数查看更多）`
+            : `\n\n（共 ${total} 份文档）`;
+        return {
+          content: makeTextContent(
+            `📋 文档列表：\n\n${text}${pageInfo}\n\n💡 用 media_search type='document' 做语义搜索定位到具体段落。`,
+          ),
+          details: {
+            total,
+            showing: existingDocs.length,
+            indexedTotal: total,
+            unindexedCount: 0,
+            cleanedMissing,
+            files: sanitized,
+          },
+        };
+      }
 
       // 数据库查询（已索引）
       const { entries: indexedEntries } = await storage.list({

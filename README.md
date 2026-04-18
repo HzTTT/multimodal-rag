@@ -1,6 +1,6 @@
 # Multimodal RAG Plugin
 
-OpenClaw 多模态 RAG 插件 —— 使用本地 AI 模型对**图像**和**音频**做语义索引与时间感知搜索。源文件删除时自动移除索引（不会删除原文件）。
+OpenClaw 多模态 RAG 插件 —— 使用本地 AI 模型对**图像 / 音频 / 文档**做语义索引与时间感知搜索。源文件删除时自动移除索引（不会删除原文件）。
 
 ```mermaid
 flowchart LR
@@ -8,14 +8,23 @@ flowchart LR
   W --> P{fileType?}
   P -- image --> V[Qwen3-VL 描述]
   P -- audio --> A[Whisper / GLM-ASR 转录]
+  P -- document --> D[pdfjs / officeparser<br/>+ OCR 回落]
+  D --> C[递归切分 chunk]
   V --> E[Embedding 向量化]
   A --> E
-  E --> S[(LanceDB)]
-  S --> T1[media_search]
-  S --> T2[media_list]
-  S --> T3[media_describe]
-  S --> T4[media_stats]
-  S --> CLI[openclaw multimodal-rag *]
+  C --> E
+  E --> M[(LanceDB media 表)]
+  E --> B[(LanceDB doc_chunks 表)]
+  M --> T1[media_search]
+  B --> T1
+  M --> T2[media_list]
+  B --> T2
+  M --> T3[media_describe]
+  B --> T3
+  M --> T4[media_stats]
+  B --> T4
+  M --> CLI[openclaw multimodal-rag *]
+  B --> CLI
 ```
 
 ## 能力一览
@@ -24,10 +33,13 @@ flowchart LR
 | --- | --- |
 | 图像理解 | Qwen3-VL（默认 `qwen3-vl:2b`），HEIC 自动 ffmpeg 拼图 |
 | 音频转录 | 本地 Whisper CLI 或智谱 GLM-ASR-2512（>30s 自动切片） |
+| 文档解析 | PDF (`pdfjs-dist`) / docx-xlsx-pptx (`officeparser`) / txt-md-html 原文；扫描页走 OCR 回落 |
+| OCR | 复用 Ollama VLM（`ocrModel` 或 fallback `visionModel`）；PDF 渲染用 `pdftoppm`（poppler） |
+| Chunk 切分 | 递归"段落→句子→字数"，默认 800 字符 + 120 overlap |
 | 向量化 | Ollama `qwen3-embedding`（4096 维）或 OpenAI `text-embedding-3-*` |
-| 向量存储 | LanceDB（带标量索引、auto-optimize、跨实例 checkoutLatest） |
-| 文件监听 | chokidar，含 debounce、SHA256 去重、move-reuse、broken-file 隔离 |
-| Agent 工具 | `media_search` / `media_list` / `media_describe` / `media_stats` |
+| 向量存储 | LanceDB 双表：`media`（image/audio）+ `doc_chunks`（document）；带标量索引、auto-optimize、checkoutLatest |
+| 文件监听 | chokidar，含 debounce、SHA256 去重、move-reuse（仅 media）、broken-file 隔离 |
+| Agent 工具 | `media_search` / `media_list` / `media_describe` / `media_stats`（统一覆盖 media + document） |
 | CLI | 9 个命令，包括 `doctor` / `index` / `search` / `cleanup-*` / `reindex` |
 | 通知 | 批次聚合 → `openclaw agent --deliver` 触发 agent 主动回复 |
 
@@ -75,6 +87,10 @@ openclaw multimodal-rag search "东方明珠"
 - 音频转录二选一：
   - 本地 Whisper（`pipx install openai-whisper`，可用 `OPENCLAW_WHISPER_BIN` 覆盖路径）
   - 智谱 GLM-ASR（无需安装 Whisper，配置 `whisper.zhipuApiKey`）
+- 文档索引（可选，启用 `fileTypes.document` 时）：
+  - `pdftoppm`（来自 poppler）：PDF 扫描页 → PNG，供 OCR 使用。`brew install poppler` / `apt-get install poppler-utils`
+  - OCR 默认复用 `ollama.visionModel`，也可自定义 `ollama.ocrModel`（例如 `gemma3:27b`）
+  - 文本型 PDF 只用 `pdfjs-dist` 提取字符，不经过 OCR，无需 poppler
 
 详细依赖检查清单见 [`docs/operations.md`](./docs/operations.md)。
 

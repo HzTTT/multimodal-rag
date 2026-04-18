@@ -310,3 +310,30 @@ grep '"event":"cleanup_missing_entries_completed"' /tmp/openclaw/openclaw-$(date
 ```
 
 > 完整索引流程（事件触发顺序、重试退避、moved-reuse 等）见 [indexing-pipeline.md](./indexing-pipeline.md)。
+
+---
+
+## 文档（document）运维
+
+### 清理"源文件已丢失"的文档 chunks
+
+`openclaw multimodal-rag cleanup-missing` 现在会并行清理两张表：
+
+- `storage.cleanupMissingEntries`：扫 media 表
+- `storage.cleanupMissingDocChunks`：按 `filePath` 去重扫 doc_chunks 表，缺失的文件对应的所有 chunks 一起删
+
+`reindex --confirm` 会同时清空 `media` 与 `doc_chunks`（`storage.clear` 一次性清）。
+
+### OCR / pdftoppm 故障路径
+
+- **`PDF OCR 失败: pdftoppm not found in PATH`**：安装 poppler（`brew install poppler` / `apt-get install poppler-utils`）。不做 OCR 的场景（文本型 PDF）不依赖 pdftoppm。
+- **`OCR HTTP <status>`**：Ollama VLM 返回非 200。先 `openclaw multimodal-rag doctor` 核对 `ocrModel`（为空则 fallback 到 `visionModel`）和 Ollama 健康。
+- **`Document parse produced no chunks`**：DRM/加密 PDF 或完全空白文档。会被记入 broken-file marker，后续同文件不再重试。
+
+### 坏文档清除 broken-file 标记
+
+`cleanup-failed-media --confirm` 一次性清掉 `broken-files.json` 里**全部**标记（包括 image/audio/document）；仅对 media 表里的失败描述做脏数据删除，doc_chunks 的失败不会写入表（失败时 `replaceDocChunksByPath` 不会被执行），故无需单独的文档脏数据清理命令。
+
+### Doctor 新增字段
+
+`runtimeConfig` 额外打印：`ocrModel / ocrEnabled / documentChunkSize / documentChunkOverlap / documentOcrTriggerChars`；`dependencyHints` 新增 `pdfRenderRequired / ollamaRequiredForOcr / ocrModel`。
