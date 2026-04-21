@@ -176,7 +176,7 @@ openclaw multimodal-rag doctor | jq '.deferredWarnings[]'
 
 | 选项 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `--type <type>` | 否 | `all` | `image \| audio \| all` |
+| `--type <type>` | 否 | `all` | `image \| audio \| document \| all` |
 | `--after <date>` | 否 | — | ISO 日期 |
 | `--before <date>` | 否 | — | ISO 日期 |
 | `--limit <n>` | 否 | `20` | `>= 1` 的整数 |
@@ -185,10 +185,9 @@ openclaw multimodal-rag doctor | jq '.deferredWarnings[]'
 **示例**：
 
 ```bash
-openclaw multimodal-rag list
-
+openclaw multimodal-rag list                 # 媒体 + 文档都列出
 openclaw multimodal-rag list --type audio --limit 50
-
+openclaw multimodal-rag list --type document
 openclaw multimodal-rag list \
   --after 2026-02-01T00:00:00 \
   --before 2026-02-15T23:59:59 \
@@ -198,22 +197,26 @@ openclaw multimodal-rag list \
 
 **行为**：
 
-1. 解析时间和数字参数，互检 `after <= before`。
-2. 调用存储层做列表查询。
-3. 做结果文件存在性兜底校验，自动让存储层做失效索引清理。
-4. 渲染每条 `[type] fileName / 路径 / 时间 / 描述（截断 80 字符，超出加 ...）`。
-5. 当 `total > offset + visibleEntries.length` 追加 `（显示 X-Y，共 N 个）`。
-6. 与 Agent 的 `media_list` 不同，**CLI list 不做磁盘兜底**，永远只显示数据库内已索引的条目。
+1. 解析时间和数字参数，互检 `after <= before`；`--type` 默认 `all`。
+2. 分派规则：
+   - `--type document`：走 `storage.listDocSummaries`，按 `filePath` 聚合的文档列表。
+   - `--type image` / `--type audio`：走 `storage.list`，仅列该类型媒体条目。
+   - `--type all`（默认）：**先列媒体，再列文档**（媒体块与文档块之间用一个空行分隔）。
+3. 每个块内部都会做结果文件存在性兜底校验，失效索引被自动清理（媒体走 `cleanupMissingEntries`，文档走 `cleanupMissingDocChunks`）。
+4. 媒体条目渲染：`[type] fileName / 路径 / 时间 / 描述（截断 80 字符，超出加 ...）`。
+5. 文档条目渲染：`[document.ext] fileName / 路径 / 时间 / 段数（可选 p.N · 标题）/ 摘录`。
+6. 两块都支持分页尾注 `（显示 X-Y，共 N 个/份）`。
+7. 与 Agent 的 `media_list` 不同，**CLI list 不做磁盘兜底**，永远只显示数据库内已索引的条目。
 
 **等价工具**：[`media_list`](./agent-tools.md#media_list)（注意工具默认 `includeUnindexed=true`，CLI 没有）。
 
-**源码**：`src/cli.ts:211-292`
+**源码**：`src/cli.ts:266-438`
 
 ---
 
 ## openclaw multimodal-rag cleanup-missing
 
-**用途**：扫描索引，删除"源文件已不存在"的脏条目（即数据库里有记录，但 `stat` 拿不到文件）。
+**用途**：扫描索引，删除"源文件已不存在"的脏条目（即数据库里有记录，但 `stat` 拿不到文件）。**同时清理媒体（image/audio）与文档（doc_chunks）两张表**——0.5.3 起 CLI 与 storage 行为对齐，之前版本 CLI 只扫媒体表。
 
 **参数**：
 
@@ -221,7 +224,7 @@ openclaw multimodal-rag list \
 | --- | --- | --- | --- |
 | `--confirm` | 非 dry-run 模式必填 | — | 二次确认；缺失时报错并退出 |
 | `--dry-run` | 否 | — | 仅扫描并显示候选，不实际删除 |
-| `--limit <n>` | 否 | 全部 | 最多扫描条数；`>= 1` 的整数（无默认值） |
+| `--limit <n>` | 否 | 全部 | 最多扫描条数；`>= 1` 的整数（无默认值）；同时作用于媒体表（按 id）和文档表（按去重后的 filePath） |
 
 **示例**：
 
@@ -243,13 +246,24 @@ openclaw multimodal-rag cleanup-missing --confirm --limit 1000
 
 1. `dryRun` 与 `--confirm` 互斥逻辑：`!dryRun && !confirm` → 打印提示并退出非零。
 2. 解析 `--limit`（无默认值，传了就必须是 `>= 1` 整数）。
-3. 让存储层执行失效索引清理，传入 `dryRun` 与 `limit`。
-4. dry-run 输出：`✓ 预览完成：扫描 N 条，命中缺失 M 条（未执行删除）`。
-5. 执行模式输出：`✓ 清理完成：扫描 N 条，命中缺失 M 条，已删除 K 条`。
+3. 并行调用 `storage.cleanupMissingEntries`（媒体）与 `storage.cleanupMissingDocChunks`（文档 chunks）。
+4. dry-run 输出（两行分桶）：
+   ```
+   ✓ 预览完成（未执行删除）：
+     媒体：扫描 N 条，命中缺失 M 条
+     文档：扫描 X 份，命中缺失 Y 份
+   ```
+5. 执行模式输出：
+   ```
+   ✓ 清理完成：
+     媒体：扫描 N 条，命中缺失 M 条，已删除 K 条
+     文档：扫描 X 份，命中缺失 Y 份，已清理 Y 份文档的全部切片
+   ```
+6. 文档侧以 `filePath` 为去重粒度：单份文档失效 → 对应的所有 chunks 一并删除。
 
-**等价工具**：无独立工具，但 `media_search / media_list` 在每次查询时会内置"按命中条目顺带清理"的轻量版逻辑。
+**等价工具**：无独立工具，但 `media_search / media_list` 在每次查询时会内置"按命中条目顺带清理"的轻量版逻辑（已覆盖媒体 + 文档两路）。
 
-**源码**：`src/cli.ts:295-331`
+**源码**：`src/cli.ts:442-481`
 
 ---
 

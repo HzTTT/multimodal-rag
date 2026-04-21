@@ -1125,13 +1125,13 @@ export class MediaStorage {
    * 清理"索引存在但源文档文件已丢失"的条目（按 filePath 去重扫描）
    */
   async cleanupMissingDocChunks(
-    options: { dryRun?: boolean; candidates?: string[] } = {},
+    options: { dryRun?: boolean; candidates?: string[]; limit?: number } = {},
   ): Promise<CleanupMissingDocsResult> {
     const startedAt = Date.now();
     await this.ensureInitialized();
     await this.refreshToLatest();
 
-    const { dryRun = false, candidates } = options;
+    const { dryRun = false, candidates, limit } = options;
 
     // 候选集合：按 filePath 去重
     let candidatePaths: string[];
@@ -1145,6 +1145,10 @@ export class MediaStorage {
         if (p) set.add(p);
       }
       candidatePaths = [...set];
+    }
+
+    if (typeof limit === "number" && Number.isFinite(limit) && limit > 0) {
+      candidatePaths = candidatePaths.slice(0, Math.floor(limit));
     }
 
     const missingPaths: string[] = [];

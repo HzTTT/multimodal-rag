@@ -12,6 +12,7 @@ function createWatcher() {
       fileTypes: {
         image: [".jpg", ".png"],
         audio: [".mp3"],
+        document: [],
       },
       ollama: {
         baseUrl: "http://localhost:11434",
